@@ -1,0 +1,417 @@
+From b652dfd2f40905a035b2b6130d7186d6b9a3e618 Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Mon, 29 Sep 2014 00:13:38 +0000
+Subject: [PATCH 4/7] netback: netmap-mode support
+
+---
+ sys/dev/netmap/if_xnb_netmap.h | 332 +++++++++++++++++++++++++++++++++++++++++
+ sys/dev/xen/netback/netback.c  |  22 ++-
+ 2 files changed, 353 insertions(+), 1 deletion(-)
+ create mode 100644 sys/dev/netmap/if_xnb_netmap.h
+
+diff --git a/sys/dev/netmap/if_xnb_netmap.h b/sys/dev/netmap/if_xnb_netmap.h
+new file mode 100644
+index 0000000..0eab444
+--- /dev/null
++++ b/sys/dev/netmap/if_xnb_netmap.h
+@@ -0,0 +1,332 @@
++/*
++ *          xen-netback netmap support
++ *
++ *   file: if_xnb_netmap.h
++ *
++ *          NEC Europe Ltd. PROPRIETARY INFORMATION
++ *
++ * This software is supplied under the terms of a license agreement
++ * or nondisclosure agreement with NEC Europe Ltd. and may not be
++ * copied or disclosed except in accordance with the terms of that
++ * agreement. The software and its source code contain valuable trade
++ * secrets and confidential information which have to be maintained in
++ * confidence.
++ * Any unauthorized publication, transfer to third parties or duplication
++ * of the object or source code - either totally or in part – is
++ * prohibited.
++ *
++ *      Copyright (c) 2014 NEC Europe Ltd. All Rights Reserved.
++ *
++ * Authors: Joao Martins <joao.martins@neclab.eu>
++ *
++ * NEC Europe Ltd. DISCLAIMS ALL WARRANTIES, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO IMPLIED WARRANTIES OF MERCHANTABILITY
++ * AND FITNESS FOR A PARTICULAR PURPOSE AND THE WARRANTY AGAINST LATENT
++ * DEFECTS, WITH RESPECT TO THE PROGRAM AND THE ACCOMPANYING
++ * DOCUMENTATION.
++ *
++ * No Liability For Consequential Damages IN NO EVENT SHALL NEC Europe
++ * Ltd., NEC Corporation OR ANY OF ITS SUBSIDIARIES BE LIABLE FOR ANY
++ * DAMAGES WHATSOEVER (INCLUDING, WITHOUT LIMITATION, DAMAGES FOR LOSS
++ * OF BUSINESS PROFITS, BUSINESS INTERRUPTION, LOSS OF INFORMATION, OR
++ * OTHER PECUNIARY LOSS AND INDIRECT, CONSEQUENTIAL, INCIDENTAL,
++ * ECONOMIC OR PUNITIVE DAMAGES) ARISING OUT OF THE USE OF OR INABILITY
++ * TO USE THIS PROGRAM, EVEN IF NEC Europe Ltd. HAS BEEN ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGES.
++ *
++ *     THIS HEADER MAY NOT BE EXTRACTED OR MODIFIED IN ANY WAY.
++ */
++
++#include <net/netmap.h>
++#include <sys/selinfo.h>
++#include <sys/bus_dma.h>
++#include <dev/netmap/netmap_kern.h>
++
++#include <xen/xen-os.h>
++#include <xen/hypervisor.h>
++#include <xen/xen_intr.h>
++#include <xen/interface/io/netif.h>
++
++static int
++xnb_netmap_reg(struct netmap_adapter *na, int onoff)
++{
++	struct ifnet *ifp = na->ifp;
++	struct xnb_softc *xnb = ifp->if_softc;
++
++	mtx_lock(&xnb->sc_lock);
++	
++	/* Tell netback that interface is not active */
++	xnb->carrier = 0;
++	/* Tell the stack that the interface is no longer active */
++	ifp->if_drv_flags &= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
++
++	/* enable or disable flags and callbacks in na and ifp */
++	if (onoff) {
++		nm_set_native_flags(na);
++	} else {
++		nm_clear_native_flags(na);
++	}
++
++	ifp->if_drv_flags |= IFF_DRV_RUNNING;
++	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
++	xnb->carrier = 1;
++
++	mtx_unlock(&xnb->sc_lock);
++
++	return (ifp->if_drv_flags & IFF_DRV_RUNNING ? 0 : 1);
++}
++
++static int
++xnb_netmap_txsync(struct netmap_kring *kring, int flags)
++{
++	struct netmap_adapter *na = kring->na;
++	struct netmap_ring *ring = kring->ring;
++	u_int const head = kring->rhead;
++	u_int const lim = kring->nkr_num_slots - 1;
++	u_int nm_i, nic_i;
++
++	/* device-specific */
++	struct xnb_softc *xnb = na->ifp->if_softc;
++	netif_rx_back_ring_t *rxr = &xnb->ring_configs[XNB_RING_TYPE_RX].back_ring.rx_ring;
++	struct gnttab_copy *gnttab = xnb->rx_gnttab;
++	RING_IDX prod, prod_save;
++	RING_IDX copy_prod, copy_cons;
++	int notify = 0;
++	int more_to_do;
++	int __unused hv_ret;
++
++	nm_i = kring->nr_hwcur;
++	if (nm_i != head) {
++		prod = prod_save = rxr->sring->req_prod;
++		rmb();
++
++		/* Create grant copy operations 
++		 * 	copy_prod = req_prod - req_cons
++		 */
++		nic_i = netmap_idx_k2n(kring, nm_i);
++		for (copy_prod = 0; nm_i != head && rxr->req_cons != prod;
++				rxr->req_cons++, copy_prod++) {
++			struct netmap_slot *slot = &ring->slot[nm_i];
++			u_int len = slot->len;
++			void *addr = NMB(na, slot);
++			/* device-specific */
++			const netif_rx_request_t *rxq = RING_GET_REQUEST(rxr,
++				rxr->rsp_prod_pvt + copy_prod);
++			int ofs = virt_to_offset( (vm_offset_t) addr);
++
++			gnttab[copy_prod].dest.u.ref = rxq->gref;
++			gnttab[copy_prod].dest.domid = xnb->otherend_id;
++			gnttab[copy_prod].dest.offset = ofs;
++			gnttab[copy_prod].source.u.gmfn = virt_to_mfn( (vm_offset_t) addr);
++			gnttab[copy_prod].source.offset = ofs;
++			gnttab[copy_prod].source.domid = DOMID_SELF;
++			gnttab[copy_prod].len = len;
++			gnttab[copy_prod].flags = GNTCOPY_dest_gref;
++
++			nm_i = nm_next(nm_i, lim);
++			nic_i = nm_next(nic_i, lim);
++		}
++
++		if (copy_prod)
++			hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy, gnttab, copy_prod);
++
++		/* Produces requests with <copy_prod> free grants */
++		for (copy_cons = 0; copy_cons < copy_prod;
++				copy_cons++, prod++) {
++			netif_rx_request_t rxq;
++			netif_rx_response_t *rsp;
++			RING_IDX pending_idx;
++			uint16_t status = NETIF_RSP_OKAY;
++			
++			if (unlikely(gnttab[copy_cons].status)) {
++				status = NETIF_RSP_ERROR;
++				D("Bad status %u", status);
++			}
++
++			pending_idx = rxr->rsp_prod_pvt + copy_cons;
++			
++			/* Make rx response. */
++			rxq = *(RING_GET_REQUEST(rxr, pending_idx));
++			rsp = RING_GET_RESPONSE(rxr, pending_idx);
++			rsp->id = rxq.id;
++			rsp->flags = 0;
++			rsp->offset = gnttab[copy_cons].dest.offset;
++			rsp->status = gnttab[copy_cons].len;
++		}
++		
++		rxr->rsp_prod_pvt += copy_prod;
++
++		kring->nr_hwcur = nm_i;
++		kring->nr_hwtail = nm_prev(nm_i, lim);
++
++		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(rxr, notify);
++
++		if (notify != 0)
++			xen_intr_signal(xnb->xen_rx_intr_handle);
++		
++		RING_FINAL_CHECK_FOR_REQUESTS(rxr, more_to_do);
++	}
++
++	nm_txsync_finalize(kring);
++	return 0;
++}
++
++static int
++xnb_netmap_rxsync(struct netmap_kring *kring, int flags)
++{
++	struct netmap_adapter *na = kring->na;
++	struct netmap_ring *ring = kring->ring;
++	u_int nm_i;	/* index into the netmap ring */
++	u_int const lim = kring->nkr_num_slots - 1;
++	u_int const head = nm_rxsync_prologue(kring);
++	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
++
++	/* device-specific */
++	struct xnb_softc *xnb = na->ifp->if_softc;
++	netif_tx_back_ring_t * txr =
++		&xnb->ring_configs[XNB_RING_TYPE_TX].back_ring.tx_ring;
++	int notify = 0;
++	int more_to_do;
++	unsigned int copy_prod, copy_cons;
++        RING_IDX cons, prod, cons_start;
++	int __unused hv_ret;
++
++	if (unlikely(head > lim))
++		return netmap_ring_reinit(kring);
++
++	/*
++	 * First part: import newly received packets.
++	 */
++	if (netmap_no_pendintr || force_update) {
++		uint16_t slot_flags = kring->nkr_slot_flags;
++		struct gnttab_copy *gnttab = xnb->tx_gnttab;
++		
++		copy_prod = 0;
++
++		/* Producer index */
++		prod = txr->sring->req_prod;
++		rmb();
++
++		nm_i = kring->nr_hwtail;
++
++		/* Creates grant copy data structures
++		 * 	copy_prod = req_prod - req_cons
++		 */
++                for (cons_start = cons = txr->req_cons; cons != prod &&
++				copy_prod < GNTTAB_LEN;
++				cons++, copy_prod++) {
++			struct netmap_slot *slot = &ring->slot[nm_i];
++			void *addr = NMB(na, slot);
++			/* device-specific */
++			netif_tx_request_t const *txq = RING_GET_REQUEST(txr,
++				txr->rsp_prod_pvt + copy_prod);
++			int const ofs = virt_to_offset( (vm_offset_t) addr);
++
++			gnttab[copy_prod].source.u.ref = txq->gref;
++			gnttab[copy_prod].source.domid = xnb->otherend_id;
++			gnttab[copy_prod].source.offset = txq->offset;
++			gnttab[copy_prod].dest.u.gmfn = virt_to_mfn( (vm_offset_t) addr);
++			gnttab[copy_prod].dest.offset = ofs;
++			gnttab[copy_prod].dest.domid = DOMID_SELF;
++			gnttab[copy_prod].len = txq->size;
++			gnttab[copy_prod].flags = GNTCOPY_source_gref;
++
++			slot->flags = slot_flags;
++			slot->len = txq->size;
++
++			nm_i = nm_next(nm_i, lim);
++		}
++		/* Update consumer index in shared ring */
++                txr->req_cons = cons;
++
++		hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy, gnttab, copy_prod);
++
++		prod = txr->rsp_prod_pvt;
++		cons = cons_start;
++
++		/* Produces responses for <copy_prod> requests */
++		for (copy_cons = 0; copy_cons < copy_prod;
++				copy_cons++, cons++, prod++) {
++			netif_tx_request_t *txreq;
++			netif_tx_response_t *txrsp;
++			uint16_t status = NETIF_RSP_OKAY;
++
++			/* we don't discard all remaining responses
++			 * if one goes on error */
++			if (unlikely(gnttab[copy_cons].status)) {
++				status = NETIF_RSP_ERROR;
++				D("Bad status %u",
++				    status);
++			}
++
++			/* Make tx response. */
++                        txreq = RING_GET_REQUEST(txr, cons);
++			txrsp = RING_GET_RESPONSE(txr, prod);
++			txrsp->id = txreq->id;
++			txrsp->status = status;
++		}
++
++		/* Update response producer index (private) */
++		txr->rsp_prod_pvt += copy_cons;
++		
++		/* Updates shared view and checks if frontend needs kick */
++		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(txr, notify);
++		if (notify != 0)
++			xen_intr_signal(xnb->xen_tx_intr_handle);
++		
++		/* Updates req_event with req_prod + 1 */
++		RING_FINAL_CHECK_FOR_REQUESTS(txr, more_to_do);
++
++		kring->nr_hwtail = nm_i;
++		kring->nr_kflags &= ~NKR_PENDINTR;
++	}
++	
++	/*
++	 * Second part: skip past packets that userspace has released.
++	 */
++	nm_i = kring->nr_hwcur; /* netmap ring index */
++	if (nm_i != head) {
++		for (; nm_i != head;) {
++			struct netmap_slot *slot = &ring->slot[nm_i];
++			void *addr = NMB(na, slot);
++
++			if (addr == NETMAP_BUF_BASE(na)) /* bad buf */
++				return netmap_ring_reinit(kring);
++
++			slot->flags &= ~NS_BUF_CHANGED;
++
++			/* Nothing to do. */
++
++			nm_i = nm_next(nm_i, lim);
++		}
++
++		kring->nr_hwcur = head;
++	}
++
++	/* tell userspace that there might be new packets */
++	nm_rxsync_finalize(kring);
++
++	return 0;
++}
++
++static void
++xnb_netmap_attach(struct xnb_softc *xnb)
++{
++	struct netmap_adapter na;
++
++	bzero(&na, sizeof(na));
++
++	na.ifp = xnb->xnb_ifp;
++	na.num_tx_desc = NET_TX_RING_SIZE;
++	na.num_rx_desc = NET_RX_RING_SIZE;
++	na.nm_register = xnb_netmap_reg;
++	na.nm_txsync = xnb_netmap_txsync;
++	na.nm_rxsync = xnb_netmap_rxsync;
++	
++	// XXX 'feature-multi-queue' is not yet supported
++	na.num_tx_rings = na.num_rx_rings = 1;
++
++	D("%s: txd %d rxd %d \n", xnb->xnb_ifp->if_xname, na.num_tx_desc, na.num_rx_desc);
++
++	netmap_attach(&na);
++}
+diff --git a/sys/dev/xen/netback/netback.c b/sys/dev/xen/netback/netback.c
+index 5d6fcd2..2d046c3 100644
+--- a/sys/dev/xen/netback/netback.c
++++ b/sys/dev/xen/netback/netback.c
+@@ -637,6 +637,10 @@ struct xnb_softc {
+ 	char			 if_name[IFNAMSIZ];
+ };
+ 
++#ifdef DEV_NETMAP
++#include <dev/netmap/if_xnb_netmap.h>
++#endif /* DEV_NETMAP */
++
+ /*---------------------------- Debugging functions ---------------------------*/
+ #ifdef XNB_DEBUG
+ static void __unused
+@@ -1417,6 +1421,9 @@ xnb_shutdown(struct xnb_softc *xnb)
+ 	/* Free the network interface */
+ 	xnb->carrier = 0;
+ 	if (xnb->xnb_ifp != NULL) {
++#ifdef DEV_NETMAP
++		netmap_detach(xnb->xnb_ifp);
++#endif /* DEV_NETMAP */
+ 		ether_ifdetach(xnb->xnb_ifp);
+ 		if_free(xnb->xnb_ifp);
+ 		xnb->xnb_ifp = NULL;
+@@ -1678,6 +1685,10 @@ xnb_attach(device_t dev)
+ 		return error;
+ 	}
+ 
++#ifdef DEV_NETMAP
++	xnb_netmap_attach(xnb);
++#endif /* DEV_NETMAP */
++
+ 	/* Tell the front end that we are ready to connect. */
+ 	xenbus_set_state(dev, XenbusStateInitWait);
+ 
+@@ -1798,18 +1809,27 @@ xnb_frontend_changed(device_t dev, XenbusState frontend_state)
+  *             binding - the xnb_softc for this instance.
+  */
+ static void
+-xnb_intr(void *arg)
++xnb_tx_intr(void *arg)
+ {
+ 	struct xnb_softc *xnb;
+ 	struct ifnet *ifp;
+ 	netif_tx_back_ring_t *txb;
+ 	RING_IDX req_prod_local;
++	u_int processed = 0;
+ 
+ 	xnb = (struct xnb_softc *)arg;
+ 	ifp = xnb->xnb_ifp;
+ 	txb = &xnb->ring_configs[XNB_RING_TYPE_TX].back_ring.tx_ring;
+ 
+ 	mtx_lock(&xnb->tx_lock);
++
++#ifdef DEV_NETMAP
++	if (netmap_rx_irq(ifp, 0, &processed)) {
++		mtx_unlock(&xnb->tx_lock);
++		return;
++	}
++#endif /* DEV_NETMAP */
++
+ 	do {
+ 		int notify;
+ 		req_prod_local = txb->sring->req_prod;
+-- 
+1.9.0
+

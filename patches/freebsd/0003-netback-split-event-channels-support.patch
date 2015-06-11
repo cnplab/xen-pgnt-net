@@ -1,0 +1,281 @@
+From fb9c051b819c9d493eaa2441dea8e28c4b773dd3 Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Mon, 29 Sep 2014 00:11:18 +0000
+Subject: [PATCH 3/7] netback: split event channels support
+
+---
+ sys/dev/xen/netback/netback.c | 168 ++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 144 insertions(+), 24 deletions(-)
+
+diff --git a/sys/dev/xen/netback/netback.c b/sys/dev/xen/netback/netback.c
+index 123f361..5d6fcd2 100644
+--- a/sys/dev/xen/netback/netback.c
++++ b/sys/dev/xen/netback/netback.c
+@@ -109,7 +109,9 @@ static MALLOC_DEFINE(M_XENNETBACK, "xnb", "Xen Net Back Driver Data");
+ #define	XNB_GSO_TCPV4 1	/* netback driver supports feature-gso-tcpv4 */
+ #define	XNB_RX_COPY 1	/* netback driver supports feature-rx-copy */
+ #define	XNB_RX_FLIP 0	/* netback driver does not support feature-rx-flip */
+-#define	XNB_PERSISTENT_GNT 1	/* netback driver does not support feature-persistent */
++#define	XNB_PERSISTENT_GNT 1	/* netback driver supports feature-persistent */
++#define XNB_SPLIT_EVENT_CHN 1	/* netback driver supports feature-split-event-channels */
++
+ 
+ #undef XNB_DEBUG
+ #define	XNB_DEBUG /* hardcode on during development */
+@@ -181,6 +183,8 @@ static int	create_netdev(device_t dev);
+ static int	xnb_detach(device_t dev);
+ static int	xnb_ifmedia_upd(struct ifnet *ifp);
+ static void	xnb_ifmedia_sts(struct ifnet *ifp, struct ifmediareq *ifmr);
++static void	xnb_tx_intr(void *arg);
++static void	xnb_rx_intr(void *arg);
+ static void	xnb_intr(void *arg);
+ static int	xnb_send(netif_rx_back_ring_t *rxb, domid_t otherend,
+ 			 const struct mbuf *mbufc, struct ifnet *ifnet,
+@@ -508,13 +512,19 @@ struct xnb_softc {
+ 	char			*bridge;
+ 
+ 	/** The interrupt driven even channel used to signal ring events. */
+-	evtchn_port_t		evtchn;
++	evtchn_port_t		tx_evtchn;
++
++	/** The interrupt driven even channel used to signal ring events. */
++	evtchn_port_t		rx_evtchn;
+ 
+ 	/** Xen device handle.*/
+ 	long			handle;
+ 
+ 	/** Handle to the communication ring event channel. */
+-	xen_intr_handle_t	xen_intr_handle;
++	xen_intr_handle_t	xen_tx_intr_handle;
++
++	/** Handle to the communication ring event channel. */
++	xen_intr_handle_t	xen_rx_intr_handle;
+ 
+ 	/**
+ 	 * \brief Cached value of the front-end's domain id.
+@@ -882,11 +892,20 @@ static int
+ xnb_disconnect(struct xnb_softc *xnb)
+ {
+ 	struct gnttab_unmap_grant_ref gnts[XNB_NUM_RING_TYPES];
++	bool separate_tx_rx_intr =
++		(xnb->tx_evtchn != xnb->rx_evtchn);
+ 	int error;
+ 	int i;
+ 
+-	if (xnb->xen_intr_handle != NULL)
+-		xen_intr_unbind(&xnb->xen_intr_handle);
++	if (separate_tx_rx_intr) {
++		if (xnb->xen_tx_intr_handle != NULL)
++			xen_intr_unbind(&xnb->xen_tx_intr_handle);
++		if (xnb->xen_rx_intr_handle != NULL)
++			xen_intr_unbind(&xnb->xen_rx_intr_handle);
++	} else {
++		if (xnb->xen_tx_intr_handle != NULL)
++			xen_intr_unbind(&xnb->xen_tx_intr_handle);
++	}
+ 
+ 	/*
+ 	 * We may still have another thread currently processing requests.  We
+@@ -1003,8 +1022,10 @@ xnb_connect_ring(struct xnb_softc *xnb, xnb_ring_type_t ring_type)
+ static int
+ xnb_connect_comms(struct xnb_softc *xnb)
+ {
+-	int	error;
++	int	error = 0;
+ 	xnb_ring_type_t i;
++	bool separate_tx_rx_intr =
++		(xnb->tx_evtchn != xnb->rx_evtchn);
+ 
+ 	if ((xnb->flags & XNBF_RING_CONNECTED) != 0)
+ 		return (0);
+@@ -1021,22 +1042,57 @@ xnb_connect_comms(struct xnb_softc *xnb)
+ 
+ 	xnb->flags |= XNBF_RING_CONNECTED;
+ 
+-	error = xen_intr_bind_remote_port(xnb->dev,
+-					  xnb->otherend_id,
+-					  xnb->evtchn,
+-					  /*filter*/NULL,
+-					  xnb_intr, /*arg*/xnb,
+-					  INTR_TYPE_BIO | INTR_MPSAFE,
+-					  &xnb->xen_intr_handle);
+-	if (error != 0) {
+-		(void)xnb_disconnect(xnb);
+-		xenbus_dev_fatal(xnb->dev, error, "binding event channel");
+-		return (error);
++	if (!separate_tx_rx_intr) {
++		error = xen_intr_bind_remote_port(xnb->dev,
++						  xnb->otherend_id,
++						  xnb->tx_evtchn,
++						  /*filter*/NULL,
++						  xnb_intr, /*arg*/xnb,
++						  INTR_TYPE_BIO | INTR_MPSAFE,
++						  &xnb->xen_tx_intr_handle);
++		if (error != 0) {
++			xenbus_dev_fatal(xnb->dev, error,
++					"binding event channel");
++			goto err_tx_bind;
++		}
++		xnb->xen_rx_intr_handle = xnb->xen_tx_intr_handle;
++	} else {
++		error = xen_intr_bind_remote_port(xnb->dev,
++						  xnb->otherend_id,
++						  xnb->tx_evtchn,
++						  /*filter*/NULL,
++						  xnb_tx_intr, /*arg*/xnb,
++						  INTR_TYPE_BIO | INTR_MPSAFE,
++						  &xnb->xen_tx_intr_handle);
++		if (error != 0) {
++			xenbus_dev_fatal(xnb->dev, error,
++					"binding event channel tx");
++			goto err_tx_bind;
++		}
++
++		error = xen_intr_bind_remote_port(xnb->dev,
++						  xnb->otherend_id,
++						  xnb->rx_evtchn,
++						  /*filter*/NULL,
++						  xnb_rx_intr, /*arg*/xnb,
++						  INTR_TYPE_BIO | INTR_MPSAFE,
++						  &xnb->xen_rx_intr_handle);
++		if (error != 0) {
++			xenbus_dev_fatal(xnb->dev, error,
++					"binding event channel rx");
++			goto err_rx_bind;
++		}
+ 	}
+ 
+ 	DPRINTF("rings connected!\n");
+-
+ 	return (0);
++
++err_rx_bind:
++	xen_intr_unbind(&xnb->xen_rx_intr_handle);
++err_tx_bind:
++	xen_intr_unbind(&xnb->xen_tx_intr_handle);
++	(void) xnb_disconnect(xnb);
++	return (error);
+ }
+ 
+ /**
+@@ -1122,10 +1178,9 @@ xnb_collect_xenstore_info(struct xnb_softc *xnb)
+ 	/* Collect the critical communication parameters */
+ 	err = xs_gather(XST_NIL, otherend_path,
+ 	    "tx-ring-ref", "%l" PRIu32,
+-	    	&xnb->ring_configs[XNB_RING_TYPE_TX].ring_ref,
++		&xnb->ring_configs[XNB_RING_TYPE_TX].ring_ref,
+ 	    "rx-ring-ref", "%l" PRIu32,
+-	    	&xnb->ring_configs[XNB_RING_TYPE_RX].ring_ref,
+-	    "event-channel", "%" PRIu32, &xnb->evtchn,
++		&xnb->ring_configs[XNB_RING_TYPE_RX].ring_ref,
+ 	    NULL);
+ 	if (err != 0) {
+ 		xenbus_dev_fatal(xnb->dev, err,
+@@ -1135,6 +1190,22 @@ xnb_collect_xenstore_info(struct xnb_softc *xnb)
+ 		return (err);
+ 	}
+ 
++	/* Try split event channels first, then single event channel. */
++	err = xs_gather(XST_NIL, otherend_path,
++			    "event-channel-tx", "%" PRIu32, &xnb->tx_evtchn,
++			    "event-channel-rx", "%" PRIu32, &xnb->rx_evtchn, NULL);
++	if (err != 0) {
++		err = xs_gather(XST_NIL, otherend_path,
++			"event-channel", "%" PRIu32, &xnb->tx_evtchn, NULL);
++		if (err != 0) {
++			xenbus_dev_fatal(xnb->dev, err,
++				"Unable to retrieve event-channel(-tx/rx) from"
++				 "frontend %s. Unable to connect",
++				 otherend_path);
++		}
++		xnb->rx_evtchn = xnb->tx_evtchn;
++	}
++
+ 	/* Collect the handle from xenstore */
+ 	err = xs_scanf(XST_NIL, our_path, "handle", NULL, "%li", &xnb->handle);
+ 	if (err != 0) {
+@@ -1260,6 +1331,15 @@ xnb_publish_backend_info(struct xnb_softc *xnb)
+ 
+ 	} while (error == EAGAIN);
+ 
++	/*
++	 * Split event channels support
++	 */
++	error = xs_printf(XST_NIL, our_path,
++			    "feature-split-event-channels",
++			    "%u", XNB_SPLIT_EVENT_CHN);
++	if (error)
++		DPRINTF("Error writing feature-split-event-channels\n");
++
+ 	return (error);
+ }
+ 
+@@ -1750,14 +1830,54 @@ xnb_intr(void *arg)
+ 
+ 		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(txb, notify);
+ 		if (notify != 0)
+-			xen_intr_signal(xnb->xen_intr_handle);
++			xen_intr_signal(xnb->xen_tx_intr_handle);
+ 
+ 		txb->sring->req_event = txb->req_cons + 1;
+ 		xen_mb();
+ 	} while (txb->sring->req_prod != req_prod_local) ;
+ 	mtx_unlock(&xnb->tx_lock);
++}
++
++/**
++ * Interrupt handler bound to the shared ring's event channel.
++ * Entry point for the xennet receive path in netback
++ * Transfers packets from the host's generic networking stack to the Xen ring
++ *
++ * \param arg  Callback argument registerd during event channel
++ *             binding - the xnb_softc for this instance.
++ */
++static void
++xnb_rx_intr(void *arg)
++{
++	struct xnb_softc *xnb = (struct xnb_softc *)arg;
++	struct ifnet *ifp = xnb->xnb_ifp;
++
++	mtx_lock(&xnb->rx_lock);
++
++#ifdef DEV_NETMAP
++	if (netmap_tx_irq(ifp, 0)) {
++		mtx_unlock(&xnb->rx_lock);
++		return;
++	}
++#endif /* DEV_NETMAP */
+ 
+-	xnb_start(ifp);
++	xnb_start_locked(ifp);
++	mtx_unlock(&xnb->rx_lock);
++}
++
++/**
++ * Interrupt handler bound to the shared ring's event channel.
++ * Entry point for the xennet transmit path in netback
++ * Transfers packets from the Xen ring to the host's generic networking stack
++ *
++ * \param arg  Callback argument registerd during event channel
++ *             binding - the xnb_softc for this instance.
++ */
++static void
++xnb_intr(void *arg)
++{
++	xnb_tx_intr(arg);
++	xnb_rx_intr(arg);
+ }
+ 
+ 
+@@ -2945,7 +3065,7 @@ xnb_start_locked(struct ifnet *ifp)
+ 
+ 		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(rxb, notify);
+ 		if ((notify != 0) || (out_of_space != 0))
+-			xen_intr_signal(xnb->xen_intr_handle);
++			xen_intr_signal(xnb->xen_rx_intr_handle);
+ 		rxb->sring->req_event = req_prod_local + 1;
+ 		xen_mb();
+ 	} while (rxb->sring->req_prod != req_prod_local) ;
+-- 
+1.9.0
+

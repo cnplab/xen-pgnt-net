@@ -1,0 +1,490 @@
+From 068227f1272a3a8ae0c0871c9f03e18b80f2beb4 Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Wed, 1 Oct 2014 22:25:09 +0000
+Subject: [PATCH 6/7] netback: persistent grants support in netmap-mode
+
+---
+ sys/dev/netmap/if_xnb_netmap.h | 242 +++++++++++++++++++++++++++++++++--------
+ sys/dev/xen/netback/netback.c  |  42 +++++++
+ 2 files changed, 239 insertions(+), 45 deletions(-)
+
+diff --git a/sys/dev/netmap/if_xnb_netmap.h b/sys/dev/netmap/if_xnb_netmap.h
+index 0eab444..e449c25 100644
+--- a/sys/dev/netmap/if_xnb_netmap.h
++++ b/sys/dev/netmap/if_xnb_netmap.h
+@@ -54,7 +54,7 @@ xnb_netmap_reg(struct netmap_adapter *na, int onoff)
+ 	struct xnb_softc *xnb = ifp->if_softc;
+ 
+ 	mtx_lock(&xnb->sc_lock);
+-	
++
+ 	/* Tell netback that interface is not active */
+ 	xnb->carrier = 0;
+ 	/* Tell the stack that the interface is no longer active */
+@@ -77,6 +77,42 @@ xnb_netmap_reg(struct netmap_adapter *na, int onoff)
+ }
+ 
+ static int
++xnb_add_gnts(struct xnb_softc *xnb, gnttab_map_table gntmap,
++	   vm_offset_t *mmap_pages, RING_IDX map_prod)
++{
++	struct persistent_gnt *persistent_gnt = NULL;
++	RING_IDX map_cons;
++	int error = 0;
++
++	/* Adds previously map grants to the tree */
++	for (map_cons = 0; map_cons < map_prod; map_cons++) {
++		if (unlikely(gntmap[map_cons].status))
++			continue;
++
++		persistent_gnt = malloc(sizeof(struct persistent_gnt),
++					M_XENNETBACK, M_NOWAIT | M_ZERO);
++		if (!persistent_gnt)
++			break;
++
++		persistent_gnt->kaddr = gntmap[map_cons].host_addr;
++		persistent_gnt->addr = (uint64_t) mmap_pages[map_cons];
++		persistent_gnt->ref = gntmap[map_cons].ref;
++		persistent_gnt->handle = gntmap[map_cons].handle;
++
++		error = add_persistent_gnt(xnb, persistent_gnt);
++		if (error < 0) {
++			free(persistent_gnt, M_XENNETBACK);
++			break;
++		}
++
++		ND("Mapping %d gref from domain %d\n", persistent_gnt->ref,
++				xnb->otherend_id);
++	}
++
++	return 0;
++}
++
++static int
+ xnb_netmap_txsync(struct netmap_kring *kring, int flags)
+ {
+ 	struct netmap_adapter *na = kring->na;
+@@ -87,7 +123,9 @@ xnb_netmap_txsync(struct netmap_kring *kring, int flags)
+ 
+ 	/* device-specific */
+ 	struct xnb_softc *xnb = na->ifp->if_softc;
+-	netif_rx_back_ring_t *rxr = &xnb->ring_configs[XNB_RING_TYPE_RX].back_ring.rx_ring;
++	uint8_t use_persistent_gnts = xnb->pgnt;
++	struct xnb_ring_config *config = &xnb->ring_configs[XNB_RING_TYPE_RX];
++	netif_rx_back_ring_t *rxr = &config->back_ring.rx_ring;
+ 	struct gnttab_copy *gnttab = xnb->rx_gnttab;
+ 	RING_IDX prod, prod_save;
+ 	RING_IDX copy_prod, copy_cons;
+@@ -95,65 +133,126 @@ xnb_netmap_txsync(struct netmap_kring *kring, int flags)
+ 	int more_to_do;
+ 	int __unused hv_ret;
+ 
++	/* persistent grants support */
++	RING_IDX map_prod;
++	struct xnb_meta *meta = xnb->rx_meta;
++	struct gnttab_map_grant_ref *gntmap = xnb->rx_gntmap;
++	vm_offset_t *mmap_pages = xnb->rx_pages;
++	struct persistent_gnt *persistent_gnt = NULL;
++
+ 	nm_i = kring->nr_hwcur;
+ 	if (nm_i != head) {
+ 		prod = prod_save = rxr->sring->req_prod;
+ 		rmb();
+ 
+-		/* Create grant copy operations 
+-		 * 	copy_prod = req_prod - req_cons
++		/* Create grant copy operations
++		 *	copy_prod = req_prod - req_cons
+ 		 */
++		map_prod = 0;
+ 		nic_i = netmap_idx_k2n(kring, nm_i);
+-		for (copy_prod = 0; nm_i != head && rxr->req_cons != prod;
++		for (copy_prod = 0;
++				nm_i != head && rxr->req_cons != prod;
+ 				rxr->req_cons++, copy_prod++) {
++
+ 			struct netmap_slot *slot = &ring->slot[nm_i];
+ 			u_int len = slot->len;
+ 			void *addr = NMB(na, slot);
++			vm_offset_t v_addr;
+ 			/* device-specific */
+ 			const netif_rx_request_t *rxq = RING_GET_REQUEST(rxr,
+ 				rxr->rsp_prod_pvt + copy_prod);
+ 			int ofs = virt_to_offset( (vm_offset_t) addr);
+ 
+-			gnttab[copy_prod].dest.u.ref = rxq->gref;
+-			gnttab[copy_prod].dest.domid = xnb->otherend_id;
+-			gnttab[copy_prod].dest.offset = ofs;
+-			gnttab[copy_prod].source.u.gmfn = virt_to_mfn( (vm_offset_t) addr);
+-			gnttab[copy_prod].source.offset = ofs;
+-			gnttab[copy_prod].source.domid = DOMID_SELF;
+-			gnttab[copy_prod].len = len;
+-			gnttab[copy_prod].flags = GNTCOPY_dest_gref;
++			if (use_persistent_gnts) { /* memcpy */
++				persistent_gnt = get_persistent_gnt(xnb, rxq->gref);
++				if (!persistent_gnt) {
++					v_addr = (vm_offset_t) config->map_addr +
++							(PAGE_SIZE * (config->map_pages +
++								      map_prod));
++					gntmap[map_prod].ref = rxq->gref;
++					gntmap[map_prod].host_addr = vtophys(v_addr);
++					gntmap[map_prod].dom = xnb->otherend_id;
++					gntmap[map_prod].flags = GNTMAP_host_map;
++					mmap_pages[map_prod] = v_addr;
++					map_prod++;
++				} else {
++					v_addr = persistent_gnt->addr;
++				}
++
++				meta[copy_prod].ref = rxq->gref;
++				meta[copy_prod].gnt = persistent_gnt;
++				meta[copy_prod].source = addr;
++				meta[copy_prod].dest   = (char*) v_addr;
++			} else { /* Grant copy */
++				gnttab[copy_prod].dest.u.ref = rxq->gref;
++				gnttab[copy_prod].dest.domid = xnb->otherend_id;
++				gnttab[copy_prod].dest.offset = ofs;
++				gnttab[copy_prod].source.u.gmfn =
++					virt_to_mfn( (vm_offset_t) addr);
++				gnttab[copy_prod].source.offset = ofs;
++				gnttab[copy_prod].source.domid = DOMID_SELF;
++				gnttab[copy_prod].len = len;
++				gnttab[copy_prod].flags = GNTCOPY_dest_gref;
++			}
++
++			meta[copy_prod].id = rxq->id;
++			meta[copy_prod].size = len;
+ 
+ 			nm_i = nm_next(nm_i, lim);
+ 			nic_i = nm_next(nic_i, lim);
+ 		}
+ 
+-		if (copy_prod)
+-			hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy, gnttab, copy_prod);
++		if (map_prod) {
++			hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_map_grant_ref,
++							   gntmap, map_prod);
++			KASSERT(hv_ret == 0,
++					("GNTTABOP_map_grant_ref returned %d\n", hv_ret));
++			hv_ret = xnb_add_gnts(xnb, gntmap, mmap_pages, map_prod);
++			config->map_pages += map_prod;
++		}
++
++		if (copy_prod && !use_persistent_gnts)
++			hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy,
++							   gnttab, copy_prod);
+ 
+ 		/* Produces requests with <copy_prod> free grants */
+ 		for (copy_cons = 0; copy_cons < copy_prod;
+ 				copy_cons++, prod++) {
++
+ 			netif_rx_request_t rxq;
+ 			netif_rx_response_t *rsp;
++			struct xnb_meta *rxm = &meta[copy_cons];
+ 			RING_IDX pending_idx;
+ 			uint16_t status = NETIF_RSP_OKAY;
+-			
+-			if (unlikely(gnttab[copy_cons].status)) {
++
++			if (use_persistent_gnts) {
++				/* Recently added to the tree*/
++				if (unlikely(rxm->gnt == NULL))
++					rxm->gnt = get_persistent_gnt(xnb, rxm->ref);
++
++				if (unlikely(rxm->gnt == NULL)) {
++					status = NETIF_RSP_ERROR;
++				} else {
++					memcpy(rxm->dest, rxm->source,
++						rxm->size);
++					put_persistent_gnt(xnb, rxm->gnt);
++				}
++
++			} else if (unlikely(gnttab[copy_cons].status)) {
+ 				status = NETIF_RSP_ERROR;
+-				D("Bad status %u", status);
+ 			}
+ 
+ 			pending_idx = rxr->rsp_prod_pvt + copy_cons;
+-			
++
+ 			/* Make rx response. */
+ 			rxq = *(RING_GET_REQUEST(rxr, pending_idx));
+ 			rsp = RING_GET_RESPONSE(rxr, pending_idx);
+ 			rsp->id = rxq.id;
+ 			rsp->flags = 0;
+-			rsp->offset = gnttab[copy_cons].dest.offset;
+-			rsp->status = gnttab[copy_cons].len;
++			rsp->offset = 0;
++			rsp->status = rxm->size;
+ 		}
+-		
++
+ 		rxr->rsp_prod_pvt += copy_prod;
+ 
+ 		kring->nr_hwcur = nm_i;
+@@ -163,7 +262,7 @@ xnb_netmap_txsync(struct netmap_kring *kring, int flags)
+ 
+ 		if (notify != 0)
+ 			xen_intr_signal(xnb->xen_rx_intr_handle);
+-		
++
+ 		RING_FINAL_CHECK_FOR_REQUESTS(rxr, more_to_do);
+ 	}
+ 
+@@ -183,14 +282,22 @@ xnb_netmap_rxsync(struct netmap_kring *kring, int flags)
+ 
+ 	/* device-specific */
+ 	struct xnb_softc *xnb = na->ifp->if_softc;
+-	netif_tx_back_ring_t * txr =
+-		&xnb->ring_configs[XNB_RING_TYPE_TX].back_ring.tx_ring;
++	uint8_t use_persistent_gnts = xnb->pgnt;
++	struct xnb_ring_config *config = &xnb->ring_configs[XNB_RING_TYPE_TX];
++	netif_tx_back_ring_t *txr = &config->back_ring.tx_ring;
+ 	int notify = 0;
+ 	int more_to_do;
+ 	unsigned int copy_prod, copy_cons;
+         RING_IDX cons, prod, cons_start;
+ 	int __unused hv_ret;
+ 
++	/* persistent grants support */
++	RING_IDX map_prod;
++	struct xnb_meta *meta = xnb->tx_meta;
++	struct gnttab_map_grant_ref *gntmap = xnb->tx_gntmap;
++	vm_offset_t *mmap_pages = xnb->tx_pages;
++	struct persistent_gnt *persistent_gnt = NULL;
++
+ 	if (unlikely(head > lim))
+ 		return netmap_ring_reinit(kring);
+ 
+@@ -200,7 +307,7 @@ xnb_netmap_rxsync(struct netmap_kring *kring, int flags)
+ 	if (netmap_no_pendintr || force_update) {
+ 		uint16_t slot_flags = kring->nkr_slot_flags;
+ 		struct gnttab_copy *gnttab = xnb->tx_gnttab;
+-		
++
+ 		copy_prod = 0;
+ 
+ 		/* Producer index */
+@@ -208,38 +315,73 @@ xnb_netmap_rxsync(struct netmap_kring *kring, int flags)
+ 		rmb();
+ 
+ 		nm_i = kring->nr_hwtail;
++		map_prod = 0;
+ 
+ 		/* Creates grant copy data structures
+-		 * 	copy_prod = req_prod - req_cons
++		 *	copy_prod = req_prod - req_cons
+ 		 */
+                 for (cons_start = cons = txr->req_cons; cons != prod &&
+ 				copy_prod < GNTTAB_LEN;
+ 				cons++, copy_prod++) {
++
+ 			struct netmap_slot *slot = &ring->slot[nm_i];
+ 			void *addr = NMB(na, slot);
++			vm_offset_t v_addr;
+ 			/* device-specific */
+ 			netif_tx_request_t const *txq = RING_GET_REQUEST(txr,
+ 				txr->rsp_prod_pvt + copy_prod);
+ 			int const ofs = virt_to_offset( (vm_offset_t) addr);
+ 
+-			gnttab[copy_prod].source.u.ref = txq->gref;
+-			gnttab[copy_prod].source.domid = xnb->otherend_id;
+-			gnttab[copy_prod].source.offset = txq->offset;
+-			gnttab[copy_prod].dest.u.gmfn = virt_to_mfn( (vm_offset_t) addr);
+-			gnttab[copy_prod].dest.offset = ofs;
+-			gnttab[copy_prod].dest.domid = DOMID_SELF;
+-			gnttab[copy_prod].len = txq->size;
+-			gnttab[copy_prod].flags = GNTCOPY_source_gref;
++			if (use_persistent_gnts) { /* memcpy */
++				persistent_gnt = get_persistent_gnt(xnb, txq->gref);
++				if (!persistent_gnt) {
++					v_addr = (vm_offset_t) config->map_addr +
++							(PAGE_SIZE * (config->map_pages +
++								      map_prod));
++					gntmap[map_prod].ref = txq->gref;
++					gntmap[map_prod].host_addr = vtophys(v_addr);
++					gntmap[map_prod].dom = xnb->otherend_id;
++					gntmap[map_prod].flags = GNTMAP_host_map | GNTMAP_readonly;
++					mmap_pages[map_prod] = v_addr;
++					map_prod++;
++				} else {
++					v_addr = persistent_gnt->addr;
++				}
++
++				meta[copy_prod].ref = txq->gref;
++				meta[copy_prod].gnt = persistent_gnt;
++				meta[copy_prod].source = addr;
++				meta[copy_prod].dest   = (char*) v_addr + txq->offset;
++			} else { /* Grant copy */
++				gnttab[copy_prod].source.u.ref = txq->gref;
++				gnttab[copy_prod].source.domid = xnb->otherend_id;
++				gnttab[copy_prod].source.offset = txq->offset;
++				gnttab[copy_prod].dest.u.gmfn = virt_to_mfn( (vm_offset_t) addr);
++				gnttab[copy_prod].dest.offset = ofs;
++				gnttab[copy_prod].dest.domid = DOMID_SELF;
++				gnttab[copy_prod].len = txq->size;
++				gnttab[copy_prod].flags = GNTCOPY_source_gref;
++			}
+ 
+ 			slot->flags = slot_flags;
+ 			slot->len = txq->size;
+ 
+ 			nm_i = nm_next(nm_i, lim);
+ 		}
++
+ 		/* Update consumer index in shared ring */
+                 txr->req_cons = cons;
+ 
+-		hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy, gnttab, copy_prod);
++		if (map_prod) {
++			hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_map_grant_ref,
++							   gntmap, map_prod);
++			xnb_add_gnts(xnb, gntmap, mmap_pages, map_prod);
++			config->map_pages += map_prod;
++		}
++
++		if (copy_prod && !use_persistent_gnts)
++			hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy,
++							   gnttab, copy_prod);
+ 
+ 		prod = txr->rsp_prod_pvt;
+ 		cons = cons_start;
+@@ -249,14 +391,24 @@ xnb_netmap_rxsync(struct netmap_kring *kring, int flags)
+ 				copy_cons++, cons++, prod++) {
+ 			netif_tx_request_t *txreq;
+ 			netif_tx_response_t *txrsp;
++			struct xnb_meta *txm = &meta[copy_cons];
+ 			uint16_t status = NETIF_RSP_OKAY;
+ 
+-			/* we don't discard all remaining responses
+-			 * if one goes on error */
+-			if (unlikely(gnttab[copy_cons].status)) {
++			if (use_persistent_gnts) {
++				/* Recently added to the tree*/
++				if (unlikely(txm->gnt == NULL))
++					txm->gnt = get_persistent_gnt(xnb, txm->ref);
++
++				if (unlikely(txm->gnt == NULL)) {
++					status = NETIF_RSP_ERROR;
++				} else {
++					memcpy(txm->dest, txm->source,
++						txm->size);
++					put_persistent_gnt(xnb, txm->gnt);
++				}
++
++			} else if (unlikely(gnttab[copy_cons].status)) {
+ 				status = NETIF_RSP_ERROR;
+-				D("Bad status %u",
+-				    status);
+ 			}
+ 
+ 			/* Make tx response. */
+@@ -268,19 +420,19 @@ xnb_netmap_rxsync(struct netmap_kring *kring, int flags)
+ 
+ 		/* Update response producer index (private) */
+ 		txr->rsp_prod_pvt += copy_cons;
+-		
++
+ 		/* Updates shared view and checks if frontend needs kick */
+ 		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(txr, notify);
+ 		if (notify != 0)
+ 			xen_intr_signal(xnb->xen_tx_intr_handle);
+-		
++
+ 		/* Updates req_event with req_prod + 1 */
+ 		RING_FINAL_CHECK_FOR_REQUESTS(txr, more_to_do);
+ 
+ 		kring->nr_hwtail = nm_i;
+ 		kring->nr_kflags &= ~NKR_PENDINTR;
+ 	}
+-	
++
+ 	/*
+ 	 * Second part: skip past packets that userspace has released.
+ 	 */
+@@ -322,7 +474,7 @@ xnb_netmap_attach(struct xnb_softc *xnb)
+ 	na.nm_register = xnb_netmap_reg;
+ 	na.nm_txsync = xnb_netmap_txsync;
+ 	na.nm_rxsync = xnb_netmap_rxsync;
+-	
++
+ 	// XXX 'feature-multi-queue' is not yet supported
+ 	na.num_tx_rings = na.num_rx_rings = 1;
+ 
+diff --git a/sys/dev/xen/netback/netback.c b/sys/dev/xen/netback/netback.c
+index b82049d..05a7492 100644
+--- a/sys/dev/xen/netback/netback.c
++++ b/sys/dev/xen/netback/netback.c
+@@ -174,6 +174,16 @@ typedef struct gnttab_map_grant_ref gnttab_map_table[GNTTAB_LEN];
+ /*--------------------------- Forward Declarations ---------------------------*/
+ struct xnb_softc;
+ struct xnb_pkt;
++struct persistent_gnt;
++
++static int			add_persistent_gnt(struct xnb_softc *xnb,
++						   struct persistent_gnt *persistent_gnt);
++static struct persistent_gnt* 	find_persistent_gnt(struct xnb_softc *xnb,
++						    grant_ref_t gref);
++static struct persistent_gnt*	get_persistent_gnt(struct xnb_softc *xnb,
++						   grant_ref_t gref);
++static void			put_persistent_gnt(struct xnb_softc *xnb,
++						   struct persistent_gnt *persistent_gnt);
+ 
+ static void	xnb_attach_failed(struct xnb_softc *xnb,
+ 				  int err, const char *fmt, ...)
+@@ -470,6 +480,18 @@ RB_HEAD(persistent_gnt_tree, persistent_gnt);
+ RB_PROTOTYPE(persistent_gnt_tree, persistent_gnt, entry, persistent_gnt_cmp);
+ RB_GENERATE(persistent_gnt_tree, persistent_gnt, entry, persistent_gnt_cmp);
+ 
++struct xnb_meta {
++	int id;
++	int size;
++
++	char *source;
++	char *dest;
++
++	vm_offset_t page;
++	grant_ref_t ref;
++	struct persistent_gnt *gnt;
++};
++
+ /**
+  * Per-instance configuration data.
+  */
+@@ -563,6 +585,16 @@ struct xnb_softc {
+ 	gnttab_map_table	rx_gntmap;
+ 
+ 	/**
++	 * Mapped pages for inflight RX requests
++	 */
++	vm_offset_t		rx_pages[GNTTAB_LEN];
++
++	/**
++	 * Preallocated descriptors for RX operations
++	 */
++	struct xnb_meta		rx_meta[GNTTAB_LEN];
++
++	/**
+ 	 * Preallocated grant table copy descriptor for TX operations.
+ 	 * Access must be protected by tx_lock
+ 	 */
+@@ -575,6 +607,16 @@ struct xnb_softc {
+ 	gnttab_map_table	tx_gntmap;
+ 
+ 	/**
++	 * Mapped pages for inflight TX requests
++	 */
++	vm_offset_t		tx_pages[GNTTAB_LEN];
++
++	/**
++	 * Preallocated descriptors for TX operations
++	 */
++	struct xnb_meta		tx_meta[GNTTAB_LEN];
++
++	/**
+ 	 * Resource representing allocated fictitious address space
+ 	 * for persistently mapped pages.
+ 	 */
+-- 
+1.9.0
+

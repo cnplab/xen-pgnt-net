@@ -1,0 +1,1169 @@
+From 5258c762b63091f76d170717bfbbe7360d597dc0 Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Fri, 29 Aug 2014 17:19:44 +0000
+Subject: [PATCH 1/7] netback: persistent grants support
+
+---
+ sys/amd64/conf/GENERIC                   |   3 +
+ sys/dev/xen/netback/netback.c            | 593 ++++++++++++++++++++++++++++---
+ sys/dev/xen/netback/netback_unit_tests.c |  63 ++--
+ 3 files changed, 592 insertions(+), 67 deletions(-)
+
+diff --git a/sys/amd64/conf/GENERIC b/sys/amd64/conf/GENERIC
+index 4269889..a81116f 100644
+--- a/sys/amd64/conf/GENERIC
++++ b/sys/amd64/conf/GENERIC
+@@ -354,5 +354,8 @@ device		hyperv			# HyperV drivers
+ options 	XENHVM			# Xen HVM kernel infrastructure
+ device		xenpci			# Xen HVM Hypervisor services driver
+ 
++# netmap support
++device		netmap
++
+ # VMware support
+ device		vmx			# VMware VMXNET3 Ethernet
+diff --git a/sys/dev/xen/netback/netback.c b/sys/dev/xen/netback/netback.c
+index 695b009..1d44baa 100644
+--- a/sys/dev/xen/netback/netback.c
++++ b/sys/dev/xen/netback/netback.c
+@@ -56,6 +56,8 @@ __FBSDID("$FreeBSD$");
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+ #include <sys/sysctl.h>
++#include <sys/tree.h>
++#include <sys/types.h>
+ 
+ #include <net/if.h>
+ #include <net/if_var.h>
+@@ -74,6 +76,7 @@ __FBSDID("$FreeBSD$");
+ #include <netinet/ip_icmp.h>
+ #include <netinet/udp.h>
+ #include <machine/in_cksum.h>
++#include <machine/atomic.h>
+ 
+ #include <vm/vm.h>
+ #include <vm/pmap.h>
+@@ -86,6 +89,7 @@ __FBSDID("$FreeBSD$");
+ #include <xen/hypervisor.h>
+ #include <xen/xen_intr.h>
+ #include <xen/interface/io/netif.h>
++#include <xen/interface/grant_table.h>
+ #include <xen/xenbus/xenbusvar.h>
+ 
+ #include <machine/xen/xenvar.h>
+@@ -102,6 +106,7 @@ static MALLOC_DEFINE(M_XENNETBACK, "xnb", "Xen Net Back Driver Data");
+ #define	XNB_GSO_TCPV4 1	/* netback driver supports feature-gso-tcpv4 */
+ #define	XNB_RX_COPY 1	/* netback driver supports feature-rx-copy */
+ #define	XNB_RX_FLIP 0	/* netback driver does not support feature-rx-flip */
++#define	XNB_PERSISTENT_GNT 1	/* netback driver does not support feature-persistent */
+ 
+ #undef XNB_DEBUG
+ #define	XNB_DEBUG /* hardcode on during development */
+@@ -116,6 +121,18 @@ static MALLOC_DEFINE(M_XENNETBACK, "xnb", "Xen Net Back Driver Data");
+ /* Default length for stack-allocated grant tables */
+ #define	GNTTAB_LEN	(64)
+ 
++/* Number of available flags */
++#define PERSISTENT_GNT_FLAGS_SIZE	2
++
++/* This persistent grant is currently in use */
++#define PERSISTENT_GNT_ACTIVE		0
++
++/* This persistent grant was recently used.
++ * It becomes active when we unset PERSISTENT_GNT_ACTIVE */
++#define PERSISTENT_GNT_WAS_ACTIVE	1
++
++#define PERSISTENT_GNT_MAX			1024
++
+ /* Features supported by all backends.  TSO and LRO can be negotiated */
+ #define	XNB_CSUM_FEATURES	(CSUM_TCP | CSUM_UDP)
+ 
+@@ -141,6 +158,11 @@ static MALLOC_DEFINE(M_XENNETBACK, "xnb", "Xen Net Back Driver Data");
+  * statically allocated memory structures.
+  */
+ typedef struct gnttab_copy gnttab_copy_table[GNTTAB_LEN];
++/**
++ * Predefined array type of grant table map descriptors.  Used to pass around
++ * statically allocated memory structures.
++ */
++typedef struct gnttab_map_grant_ref gnttab_map_table[GNTTAB_LEN];
+ 
+ /*--------------------------- Forward Declarations ---------------------------*/
+ struct xnb_softc;
+@@ -156,7 +178,8 @@ static int	xnb_ifmedia_upd(struct ifnet *ifp);
+ static void	xnb_ifmedia_sts(struct ifnet *ifp, struct ifmediareq *ifmr);
+ static void 	xnb_intr(void *arg);
+ static int	xnb_send(netif_rx_back_ring_t *rxb, domid_t otherend,
+-			 const struct mbuf *mbufc, gnttab_copy_table gnttab);
++			 const struct mbuf *mbufc, struct ifnet *ifnet,
++			 gnttab_copy_table gnttab);
+ static int	xnb_recv(netif_tx_back_ring_t *txb, domid_t otherend,
+ 			 struct mbuf **mbufc, struct ifnet *ifnet,
+ 			 gnttab_copy_table gnttab);
+@@ -166,21 +189,36 @@ static int	xnb_ring2pkt(struct xnb_pkt *pkt,
+ static void	xnb_txpkt2rsp(const struct xnb_pkt *pkt,
+ 			      netif_tx_back_ring_t *ring, int error);
+ static struct mbuf *xnb_pkt2mbufc(const struct xnb_pkt *pkt, struct ifnet *ifp);
+-static int	xnb_txpkt2gnttab(const struct xnb_pkt *pkt,
++static int	xnb_txpkt2gntmap(const struct xnb_pkt *pkt,
+ 				 const struct mbuf *mbufc,
++				 gnttab_map_table gnttab,
++				 const netif_tx_back_ring_t *txb,
++				 domid_t otherend_id,
++				 struct xnb_softc *xnb);
++static int	xnb_txpkt2gnttab(const struct xnb_pkt *pkt,
++				 struct mbuf *mbufc,
+ 				 gnttab_copy_table gnttab,
+ 				 const netif_tx_back_ring_t *txb,
+-				 domid_t otherend_id);
++				 domid_t otherend_id,
++				 struct xnb_softc *xnb);
+ static void	xnb_update_mbufc(struct mbuf *mbufc,
+ 				 const gnttab_copy_table gnttab, int n_entries);
+ static int	xnb_mbufc2pkt(const struct mbuf *mbufc,
+ 			      struct xnb_pkt *pkt,
+ 			      RING_IDX start, int space);
++static int	xnb_rxpkt2gntmap(const struct xnb_pkt *pkt,
++				 const struct mbuf *mbufc,
++				 gnttab_map_table gnttab,
++				 const netif_rx_back_ring_t *rxb,
++				 domid_t otherend_id,
++				 struct xnb_softc *xnb);
+ static int	xnb_rxpkt2gnttab(const struct xnb_pkt *pkt,
+ 				 const struct mbuf *mbufc,
+ 				 gnttab_copy_table gnttab,
+ 				 const netif_rx_back_ring_t *rxb,
+-				 domid_t otherend_id);
++				 domid_t otherend_id,
++				 struct xnb_softc *xnb,
++				 int *n_pgnt);
+ static int	xnb_rxpkt2rsp(const struct xnb_pkt *pkt,
+ 			      const gnttab_copy_table gnttab, int n_entries,
+ 			      netif_rx_back_ring_t *ring);
+@@ -197,6 +235,8 @@ static int	xnb_dump_rings(SYSCTL_HANDLER_ARGS);
+ #if defined(INET) || defined(INET6)
+ static void	xnb_add_mbuf_cksum(struct mbuf *mbufc);
+ #endif
++static int xnb_max_pgrants = PERSISTENT_GNT_MAX;
++
+ /*------------------------------ Data Structures -----------------------------*/
+ 
+ 
+@@ -311,7 +351,6 @@ xnb_dump_txreq(RING_IDX idx, const struct netif_tx_request *txreq)
+ 	}
+ }
+ 
+-
+ /**
+  * \brief Configuration data for a shared memory request ring
+  *        used to communicate with the front-end client of this
+@@ -390,6 +429,32 @@ typedef enum{
+ 	XNB_NUM_RING_TYPES
+ } xnb_ring_type_t;
+ 
++struct persistent_gnt {
++	uint64_t kaddr;
++	uint64_t addr;
++
++	grant_ref_t ref;
++	grant_handle_t handle;
++	/* DECLARE_BITMAP(flags, PERSISTENT_GNT_FLAGS_SIZE) */
++	unsigned long flags;
++	RB_ENTRY(persistent_gnt) entry;
++};
++
++static int
++persistent_gnt_cmp(const struct persistent_gnt *a, const struct persistent_gnt *b)
++{
++	if (a->ref > b->ref) {
++		return 1;
++	} else if (a->ref < b->ref) {
++		return -1;
++	}
++	return 0;
++}
++
++RB_HEAD(persistent_gnt_tree, persistent_gnt);
++RB_PROTOTYPE(persistent_gnt_tree, persistent_gnt, entry, persistent_gnt_cmp);
++RB_GENERATE(persistent_gnt_tree, persistent_gnt, entry, persistent_gnt_cmp);
++
+ /**
+  * Per-instance configuration data.
+  */
+@@ -460,6 +525,8 @@ struct xnb_softc {
+ 	uint8_t			gso_prefix;
+ 	/** Can checksum TCP/UDP over IPv4 */
+ 	uint8_t			ip_csum;
++	/** Can persistently map grants */
++	uint8_t			pgnt;
+ 
+ 	/* Implementation related fields */
+ 	/**
+@@ -469,11 +536,34 @@ struct xnb_softc {
+ 	gnttab_copy_table	rx_gnttab;
+ 
+ 	/**
++	 * Preallocated grant table copy descriptor for RX operations.
++	 * Access must be protected by rx_lock
++	 */
++	gnttab_map_table	rx_gntmap;
++
++	/**
+ 	 * Preallocated grant table copy descriptor for TX operations.
+ 	 * Access must be protected by tx_lock
+ 	 */
+ 	gnttab_copy_table	tx_gnttab;
+ 
++	/**
++	 * Preallocated grant map copy descriptor for TX operations.
++	 * Access must be protected by tx_lock
++	 */
++	gnttab_map_table	tx_gntmap;
++
++	/**
++	 * Red Black tree to store persistent grants
++	 *
++	 */
++	struct persistent_gnt_tree persistent_gnts;
++	/* Number of persistent grants */
++	unsigned int persistent_gnt_c;
++	/* Number of persistent grants in use */
++	unsigned int persistent_gnt_in_use;
++
++
+ #ifdef XENHVM
+ 	/**
+ 	 * Resource representing allocated physical address space
+@@ -617,6 +707,117 @@ xnb_dump_mbuf(const struct mbuf *m)
+ }
+ #endif /* XNB_DEBUG */
+ 
++static struct persistent_gnt*
++find_persistent_gnt(struct xnb_softc *xnb, grant_ref_t gref)
++{
++	struct persistent_gnt pgnt, *data;
++	pgnt.ref = gref;
++	data = RB_FIND(persistent_gnt_tree, &xnb->persistent_gnts, &pgnt);
++	return data;
++}
++
++
++static int
++add_persistent_gnt(struct xnb_softc *xnb,
++				struct persistent_gnt *persistent_gnt)
++{
++	struct persistent_gnt *data;
++
++	if (xnb->persistent_gnt_c >= xnb_max_pgrants) {
++		DPRINTF("Maximum number of persistent grants reached\n");
++		return -EBUSY;
++	}
++
++	data = find_persistent_gnt(xnb, persistent_gnt->ref);
++	if (data != NULL) {
++		DPRINTF("Trying to add a gref that's already in the tree\n");
++		return -EEXIST;
++	}
++
++	persistent_gnt->flags = 0;
++	/* Add to the tree */
++	data = RB_INSERT(persistent_gnt_tree, &xnb->persistent_gnts,
++					persistent_gnt);
++	KASSERT(data == NULL, ("Cannot add grant to the tree\n"));
++	xnb->persistent_gnt_c++;
++	return 0;
++}
++
++static int
++free_persistent_gnts(struct xnb_softc *xnb)
++{
++	struct gnttab_unmap_grant_ref unmap[xnb->persistent_gnt_c];
++	struct persistent_gnt *pgnt, *next, *err;
++	int gnt_idx = 0;
++
++	if (!xnb->persistent_gnt_c)
++		return 0;
++
++	for (pgnt = RB_MIN(persistent_gnt_tree, &xnb->persistent_gnts);
++				pgnt != NULL; pgnt = next) {
++
++		unmap[gnt_idx].host_addr = pgnt->kaddr;
++		unmap[gnt_idx].handle = pgnt->handle;
++		unmap[gnt_idx].dev_bus_addr = 0;
++		gnt_idx++;
++
++		/* Fetch next node to delete */
++		next = RB_NEXT(persistent_gnt_tree, &xnb->persistent_gnts, pgnt);
++
++		/* Add to the tree */
++		err = RB_REMOVE(persistent_gnt_tree, &xnb->persistent_gnts,
++						pgnt);
++		KASSERT(err != NULL,
++			("Cannot remove persistent grant from the tree\n"));
++
++		free(pgnt, M_XENNETBACK);
++		xnb->persistent_gnt_c--;
++	}
++
++	KASSERT(xnb->persistent_gnt_c == 0, ("Tree is not empty"));
++
++	if (gnt_idx > 0) {
++		int __unused hv_ret = HYPERVISOR_grant_table_op(
++						GNTTABOP_unmap_grant_ref, unmap, gnt_idx);
++		KASSERT(hv_ret == 0,
++		    ("HYPERVISOR_grant_table_op returned %d\n", hv_ret));
++	}
++
++	atomic_set_int(&xnb->persistent_gnt_in_use, 0);
++	return 0;
++}
++
++
++static struct persistent_gnt*
++get_persistent_gnt(struct xnb_softc *xnb, grant_ref_t gref)
++{
++	struct persistent_gnt *data;
++
++	data = find_persistent_gnt(xnb, gref);
++	if (data == NULL) {
++		return NULL;
++	}
++
++	if (data->flags & PERSISTENT_GNT_ACTIVE) {
++		DPRINTF("Requesting a grant already in use\n");
++		return NULL;
++	}
++
++	data->flags |= PERSISTENT_GNT_ACTIVE;
++	atomic_add_int(&xnb->persistent_gnt_in_use, 1);
++	return data;
++}
++
++static void
++put_persistent_gnt(struct xnb_softc *xnb,
++				struct persistent_gnt *persistent_gnt)
++{
++	if (persistent_gnt->flags & PERSISTENT_GNT_ACTIVE) {
++		persistent_gnt->flags = (PERSISTENT_GNT_WAS_ACTIVE | ~PERSISTENT_GNT_ACTIVE);
++		atomic_subtract_int(&xnb->persistent_gnt_in_use, 1);
++	}
++}
++
+ /*------------------------ Inter-Domain Communication ------------------------*/
+ /**
+  * Free dynamically allocated KVA or pseudo-physical address allocations.
+@@ -668,6 +869,9 @@ xnb_disconnect(struct xnb_softc *xnb)
+ 	mtx_lock(&xnb->rx_lock);
+ 	mtx_unlock(&xnb->rx_lock);
+ 
++	if (xnb->pgnt)
++		free_persistent_gnts(xnb);
++
+ 	/* Free malloc'd softc member variables */
+ 	if (xnb->bridge != NULL) {
+ 		free(xnb->bridge, M_XENSTORE);
+@@ -713,6 +917,12 @@ xnb_connect_ring(struct xnb_softc *xnb, xnb_ring_type_t ring_type)
+ 	struct xnb_ring_config *ring = &xnb->ring_configs[ring_type];
+ 	int error;
+ 
++	if (xnb->pgnt) {
++		RB_INIT(&xnb->persistent_gnts);
++		xnb->persistent_gnt_c = 0;
++		atomic_set_int(&xnb->persistent_gnt_in_use, 0);
++	}
++
+ 	/* TX ring type = 0, RX =1 */
+ 	ring->va = xnb->kva + ring_type * PAGE_SIZE;
+ 	ring->gnt_addr = xnb->gnt_base_addr + ring_type * PAGE_SIZE;
+@@ -931,6 +1141,10 @@ xnb_collect_xenstore_info(struct xnb_softc *xnb)
+ 		xnb->can_sg = 0;
+ 
+ 	/* Collect remaining frontend features */
++	if (xs_scanf(XST_NIL, otherend_path, "feature-persistent", NULL,
++		     "%hhu", &xnb->pgnt) < 0)
++		xnb->pgnt = 0;
++
+ 	if (xs_scanf(XST_NIL, otherend_path, "feature-gso-tcpv4", NULL,
+ 		     "%hhu", &xnb->gso) < 0)
+ 		xnb->gso = 0;
+@@ -991,6 +1205,11 @@ xnb_publish_backend_info(struct xnb_softc *xnb)
+ 		if (error != 0)
+ 			break;
+ 
++		error = xs_printf(xst, our_path, "feature-persistent",
++				  "%d", XNB_PERSISTENT_GNT);
++		if (error != 0)
++			break;
++
+ 		error = xs_transaction_end(xst, 0);
+ 		if (error != 0 && error != EAGAIN) {
+ 			xenbus_dev_fatal(xnb->dev, error, "ending transaction");
+@@ -1169,6 +1388,15 @@ xnb_setup_sysctl(struct xnb_softc *xnb)
+ 	if (sysctl_tree == NULL)
+ 		return;
+ 
++	SYSCTL_ADD_INT(sysctl_ctx,
++			SYSCTL_CHILDREN(sysctl_tree),
++			OID_AUTO,
++			"max_persistent_grants",
++			CTLFLAG_RW,
++			&xnb_max_pgrants,
++			PERSISTENT_GNT_MAX,
++			"Maximum number of grants to map persistently");
++
+ #ifdef XNB_DEBUG
+ 	SYSCTL_ADD_PROC(sysctl_ctx,
+ 			SYSCTL_CHILDREN(sysctl_tree),
+@@ -1472,7 +1700,7 @@ xnb_intr(void *arg)
+ 			err = xnb_recv(txb, xnb->otherend_id, &mbufc, ifp,
+ 			    	       xnb->tx_gnttab);
+ 			if (err || (mbufc == NULL))
+-				break;
++				break;			
+ 
+ 			/* Send the packet to the generic network stack */
+ 			(*xnb->xnb_ifp->if_input)(xnb->xnb_ifp, mbufc);
+@@ -1713,6 +1941,126 @@ xnb_pkt2mbufc(const struct xnb_pkt *pkt, struct ifnet *ifp)
+ }
+ 
+ /**
++ * Build a gnttab_map table that can be used to copy data from a pkt
++ * to an mbufc.  Does not actually perform the copy.  Always uses gref's on
++ * the packet side.
++ * \param[in]	pkt	pkt's associated requests form the src for
++ * 			the copy operation
++ * \param[in]	mbufc	mbufc's storage forms the dest for the copy operation
++ * \param[out]  gnttab	Storage for the returned grant table
++ * \param[in]	txb	Pointer to the backend ring structure
++ * \param[in]	otherend_id	The domain ID of the other end of the copy
++ * \return 		The number of gnttab entries filled
++ */
++static int
++xnb_txpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
++		 gnttab_map_table gntmap, const netif_tx_back_ring_t *txb,
++		 domid_t otherend_id, struct xnb_softc *xnb)
++{
++
++	const struct mbuf *mbuf = mbufc;/* current mbuf within the chain */
++	int gnt_idx = 0;		/* index into grant table */
++	RING_IDX r_idx = pkt->car;	/* index into tx ring buffer */
++	int r_ofs = 0;	/* offset of next data within tx request's data area */
++	int m_ofs = 0;	/* offset of next data within mbuf's data area */
++	int size_remaining = pkt->size;	/* size in bytes that still needs to be represented in the table */
++	int err, i;
++	uint64_t map[GNTTAB_LEN];
++
++	if (!xnb->pgnt)
++		return 0;
++
++	while (size_remaining > 0) {
++		const netif_tx_request_t *txq = RING_GET_REQUEST(txb, r_idx);
++		const size_t mbuf_space = M_TRAILINGSPACE(mbuf) - m_ofs;
++		const size_t req_size =
++			r_idx == pkt->car ? pkt->car_size : txq->size;
++		const size_t pkt_space = req_size - r_ofs;
++		struct persistent_gnt *persistent_gnt = NULL;
++		/*
++		 * space is the largest amount of data that can be copied in the
++		 * grant table's next entry
++		 */
++		const size_t space = MIN(pkt_space, mbuf_space);
++
++		/* TODO: handle this error condition without panicking */
++		KASSERT(gnt_idx < GNTTAB_LEN, ("Grant table is too short"));
++
++		persistent_gnt = find_persistent_gnt(xnb, txq->gref);
++		if (!persistent_gnt) {
++			uint64_t addr;
++
++			addr = (uint64_t) contigmalloc(PAGE_SIZE, M_XENNETBACK,
++							M_NOWAIT | M_ZERO, (size_t)0, -1UL, PAGE_SIZE, 0);
++
++			if (!addr) {
++				DPRINTF("No memory for persistent grants\n");
++				return -ENOMEM;
++			}
++
++			map[gnt_idx] = addr;
++			gntmap[gnt_idx].ref = txq->gref;
++			gntmap[gnt_idx].host_addr = vtophys(addr);
++			gntmap[gnt_idx].dom = otherend_id;
++			gntmap[gnt_idx].flags = (GNTMAP_host_map | GNTMAP_readonly);
++			gnt_idx++;
++		}
++
++		r_ofs += space;
++		m_ofs += space;
++		size_remaining -= space;
++		if (req_size - r_ofs <= 0) {
++			/* Must move to the next tx request */
++			r_ofs = 0;
++			r_idx = (r_idx == pkt->car) ? pkt->cdr : r_idx + 1;
++		}
++		if (M_TRAILINGSPACE(mbuf) - m_ofs <= 0) {
++			/* Must move to the next mbuf */
++			m_ofs = 0;
++			mbuf = mbuf->m_next;
++		}
++	}
++
++	if (gnt_idx > 0) {
++		int __unused hv_ret = HYPERVISOR_grant_table_op(
++						GNTTABOP_map_grant_ref, gntmap, gnt_idx);
++		KASSERT(hv_ret == 0,
++		    ("HYPERVISOR_grant_table_op returned %d\n", hv_ret));
++	}
++
++	for (i = 0; i < gnt_idx; ++i) {
++		struct persistent_gnt *persistent_gnt = NULL;
++
++		if (gntmap[i].status != 0) {
++			DPRINTF("Could not map ref %d\n", gntmap[i].ref);
++			continue;
++		}
++
++		persistent_gnt = malloc(sizeof(struct persistent_gnt),
++						M_XENNETBACK, M_NOWAIT | M_ZERO);
++
++		if (!persistent_gnt) {
++			DPRINTF("No memory for persistent grants\n");
++			return -ENOMEM;
++		}
++
++		persistent_gnt->kaddr = gntmap[i].host_addr;
++		persistent_gnt->addr = map[i];
++		persistent_gnt->ref = gntmap[i].ref;
++		persistent_gnt->handle = gntmap[i].handle;
++
++		err = add_persistent_gnt(xnb, persistent_gnt);
++		if (err < 0) {
++			continue;
++		}
++
++		DPRINTF("Mapping %d gref from domain %d\n", persistent_gnt->ref, otherend_id);
++	}
++
++	return gnt_idx;
++}
++
++/**
+  * Build a gnttab_copy table that can be used to copy data from a pkt
+  * to an mbufc.  Does not actually perform the copy.  Always uses gref's on
+  * the packet side.
+@@ -1725,18 +2073,18 @@ xnb_pkt2mbufc(const struct xnb_pkt *pkt, struct ifnet *ifp)
+  * \return 		The number of gnttab entries filled
+  */
+ static int
+-xnb_txpkt2gnttab(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
++xnb_txpkt2gnttab(const struct xnb_pkt *pkt, struct mbuf *mbufc,
+ 		 gnttab_copy_table gnttab, const netif_tx_back_ring_t *txb,
+-		 domid_t otherend_id)
++		 domid_t otherend_id, struct xnb_softc *xnb)
+ {
+ 
+-	const struct mbuf *mbuf = mbufc;/* current mbuf within the chain */
++	struct mbuf *mbuf = mbufc;/* current mbuf within the chain */
+ 	int gnt_idx = 0;		/* index into grant table */
+ 	RING_IDX r_idx = pkt->car;	/* index into tx ring buffer */
+ 	int r_ofs = 0;	/* offset of next data within tx request's data area */
+ 	int m_ofs = 0;	/* offset of next data within mbuf's data area */
+-	/* size in bytes that still needs to be represented in the table */
+-	uint16_t size_remaining = pkt->size;
++	int size_remaining = pkt->size;	/* size in bytes that still needs to be represented in the table */
++	int use_persistent_gnt = (xnb->pgnt); /* support for persistent grants */
+ 
+ 	while (size_remaining > 0) {
+ 		const netif_tx_request_t *txq = RING_GET_REQUEST(txb, r_idx);
+@@ -1749,22 +2097,32 @@ xnb_txpkt2gnttab(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 		 * grant table's next entry
+ 		 */
+ 		const size_t space = MIN(pkt_space, mbuf_space);
++		struct persistent_gnt *persistent_gnt = NULL;
+ 
+ 		/* TODO: handle this error condition without panicking */
+ 		KASSERT(gnt_idx < GNTTAB_LEN, ("Grant table is too short"));
+ 
+-		gnttab[gnt_idx].source.u.ref = txq->gref;
+-		gnttab[gnt_idx].source.domid = otherend_id;
+-		gnttab[gnt_idx].source.offset = txq->offset + r_ofs;
+-		gnttab[gnt_idx].dest.u.gmfn = virt_to_mfn(
+-		    mtod(mbuf, vm_offset_t) + m_ofs);
+-		gnttab[gnt_idx].dest.offset = virt_to_offset(
+-		    mtod(mbuf, vm_offset_t) + m_ofs);
+-		gnttab[gnt_idx].dest.domid = DOMID_SELF;
+-		gnttab[gnt_idx].len = space;
+-		gnttab[gnt_idx].flags = GNTCOPY_source_gref;
++		if (use_persistent_gnt)
++			persistent_gnt = get_persistent_gnt(xnb, txq->gref);
+ 
+-		gnt_idx++;
++		if (persistent_gnt) {
++				c_caddr_t kva = (c_caddr_t) persistent_gnt->addr;
++				m_copyback(mbuf, m_ofs, space, kva +
++								(txq->offset + r_ofs));
++				put_persistent_gnt(xnb, persistent_gnt);
++		} else {
++				gnttab[gnt_idx].source.u.ref = txq->gref;
++				gnttab[gnt_idx].source.domid = otherend_id;
++				gnttab[gnt_idx].source.offset = txq->offset + r_ofs;
++				gnttab[gnt_idx].dest.u.gmfn = virt_to_mfn(
++					mtod(mbuf, vm_offset_t) + m_ofs);
++				gnttab[gnt_idx].dest.offset = virt_to_offset(
++					mtod(mbuf, vm_offset_t) + m_ofs);
++				gnttab[gnt_idx].dest.domid = DOMID_SELF;
++				gnttab[gnt_idx].len = space;
++				gnttab[gnt_idx].flags = GNTCOPY_source_gref;
++				gnt_idx++;
++		}
+ 		r_ofs += space;
+ 		m_ofs += space;
+ 		size_remaining -= space;
+@@ -1810,7 +2168,7 @@ xnb_update_mbufc(struct mbuf *mbufc, const gnttab_copy_table gnttab,
+ 			mbuf = mbuf->m_next;
+ 		}
+ 	}
+-	mbufc->m_pkthdr.len = total_size;
++	mbufc->m_pkthdr.len += total_size;
+ 
+ #if defined(INET) || defined(INET6)
+ 	xnb_add_mbuf_cksum(mbufc);
+@@ -1838,7 +2196,9 @@ xnb_recv(netif_tx_back_ring_t *txb, domid_t otherend, struct mbuf **mbufc,
+ 	struct xnb_pkt pkt;
+ 	/* number of tx requests consumed to build the last packet */
+ 	int num_consumed;
+-	int nr_ents;
++	int nr_ents = 0;
++	struct xnb_softc *xnb = ifnet->if_softc;
++	int nr_pgnt = 0;
+ 
+ 	*mbufc = NULL;
+ 	num_consumed = xnb_ring2pkt(&pkt, txb, txb->req_cons);
+@@ -1876,16 +2236,20 @@ xnb_recv(netif_tx_back_ring_t *txb, domid_t otherend, struct mbuf **mbufc,
+ 		return ENOMEM;
+ 	}
+ 
+-	nr_ents = xnb_txpkt2gnttab(&pkt, *mbufc, gnttab, txb, otherend);
++	nr_pgnt = xnb_txpkt2gntmap(&pkt, *mbufc, xnb->tx_gntmap, txb,
++						otherend, xnb);
++	nr_ents = xnb_txpkt2gnttab(&pkt, *mbufc, gnttab, txb,
++					otherend, xnb);
+ 
+ 	if (nr_ents > 0) {
+ 		int __unused hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy,
+ 		    gnttab, nr_ents);
+ 		KASSERT(hv_ret == 0,
+ 		    ("HYPERVISOR_grant_table_op returned %d\n", hv_ret));
+-		xnb_update_mbufc(*mbufc, gnttab, nr_ents);
+ 	}
+ 
++	xnb_update_mbufc(*mbufc, gnttab, nr_ents);
++
+ 	xnb_txpkt2rsp(&pkt, txb, 0);
+ 	txb->req_cons += num_consumed;
+ 	return 0;
+@@ -1965,6 +2329,126 @@ xnb_mbufc2pkt(const struct mbuf *mbufc, struct xnb_pkt *pkt,
+ }
+ 
+ /**
++ * Build a gnttab_map table that can be used to copy data from a pkt
++ * to an mbufc.  Does not actually perform the copy.  Always uses gref's on
++ * the packet side.
++ * \param[in]	pkt	pkt's associated requests form the src for
++ * 			the copy operation
++ * \param[in]	mbufc	mbufc's storage forms the dest for the copy operation
++ * \param[out]  gnttab	Storage for the returned grant table
++ * \param[in]	txb	Pointer to the backend ring structure
++ * \param[in]	otherend_id	The domain ID of the other end of the copy
++ * \return 		The number of gnttab entries filled
++ */
++static int
++xnb_rxpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
++		 gnttab_map_table gntmap, const netif_rx_back_ring_t *rxb,
++		 domid_t otherend_id, struct xnb_softc *xnb)
++{
++
++	const struct mbuf *mbuf = mbufc;/* current mbuf within the chain */
++	int gnt_idx = 0;		/* index into grant table */
++	RING_IDX r_idx = pkt->car;	/* index into tx ring buffer */
++	int r_ofs = 0;	/* offset of next data within tx request's data area */
++	int m_ofs = 0;	/* offset of next data within mbuf's data area */
++	int size_remaining = pkt->size;	/* size in bytes that still needs to be represented in the table */
++	int err, i;
++	uint64_t map[GNTTAB_LEN];
++
++	if (!xnb->pgnt)
++		return 0;
++
++	while (size_remaining > 0) {
++		const netif_rx_request_t *rxq = RING_GET_REQUEST(rxb, r_idx);
++		const size_t mbuf_space = mbuf->m_len - m_ofs;
++		const size_t req_size = PAGE_SIZE;
++		const size_t pkt_space = req_size - r_ofs;
++		struct persistent_gnt *persistent_gnt = NULL;
++		/*
++		 * space is the largest amount of data that can be copied in the
++		 * grant table's next entry
++		 */
++		const size_t space = MIN(pkt_space, mbuf_space);
++
++		/* TODO: handle this error condition without panicking */
++		KASSERT(gnt_idx < GNTTAB_LEN, ("Grant table is too short"));
++
++		persistent_gnt = find_persistent_gnt(xnb, rxq->gref);
++		if (!persistent_gnt) {
++			uint64_t addr;
++
++			addr = (uint64_t) contigmalloc(PAGE_SIZE, M_XENNETBACK,
++							M_NOWAIT | M_ZERO, (size_t)0, -1UL, PAGE_SIZE, 0);
++
++			if (!addr) {
++				DPRINTF("No memory for persistent grants\n");
++				return -ENOMEM;
++			}
++
++			map[gnt_idx] = addr;
++			gntmap[gnt_idx].ref = rxq->gref;
++			gntmap[gnt_idx].host_addr = vtophys(addr);
++			gntmap[gnt_idx].dom = otherend_id;
++			gntmap[gnt_idx].flags = GNTMAP_host_map;
++			gnt_idx++;
++		}
++
++		r_ofs += space;
++		m_ofs += space;
++		size_remaining -= space;
++		if (req_size - r_ofs <= 0) {
++			/* Must move to the next tx request */
++			r_ofs = 0;
++			r_idx = (r_idx == pkt->car) ? pkt->cdr : r_idx + 1;
++		}
++		if (M_TRAILINGSPACE(mbuf) - m_ofs <= 0) {
++			/* Must move to the next mbuf */
++			m_ofs = 0;
++			mbuf = mbuf->m_next;
++		}
++	}
++
++	if (gnt_idx > 0) {
++		int __unused hv_ret = HYPERVISOR_grant_table_op(
++						GNTTABOP_map_grant_ref, gntmap, gnt_idx);
++		KASSERT(hv_ret == 0,
++		    ("HYPERVISOR_grant_table_op returned %d\n", hv_ret));
++	}
++
++	for (i = 0; i < gnt_idx; ++i) {
++		struct persistent_gnt *persistent_gnt = NULL;
++
++		if (gntmap[i].status != 0) {
++			DPRINTF("Could not map ref %d\n", gntmap[i].ref);
++			continue;
++		}
++
++		persistent_gnt = malloc(sizeof(struct persistent_gnt),
++						M_XENNETBACK, M_NOWAIT | M_ZERO);
++
++		if (!persistent_gnt) {
++			DPRINTF("No memory for persistent grants\n");
++			return -ENOMEM;
++		}
++
++		persistent_gnt->kaddr = gntmap[i].host_addr;
++		persistent_gnt->addr = map[i];
++		persistent_gnt->ref = gntmap[i].ref;
++		persistent_gnt->handle = gntmap[i].handle;
++
++		err = add_persistent_gnt(xnb, persistent_gnt);
++		if (err < 0) {
++			continue;
++		}
++
++		DPRINTF("Mapping %d gref from domain %d\n", persistent_gnt->ref, otherend_id);
++	}
++
++	return gnt_idx;
++}
++
++
++/**
+  * Build a gnttab_copy table that can be used to copy data from an mbuf chain
+  * to the frontend's shared buffers.  Does not actually perform the copy.
+  * Always uses gref's on the other end's side.
+@@ -1979,17 +2463,20 @@ xnb_mbufc2pkt(const struct mbuf *mbufc, struct xnb_pkt *pkt,
+ static int
+ xnb_rxpkt2gnttab(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 		 gnttab_copy_table gnttab, const netif_rx_back_ring_t *rxb,
+-		 domid_t otherend_id)
++		 domid_t otherend_id, struct xnb_softc *xnb, int *n_pgnt)
+ {
+ 
+ 	const struct mbuf *mbuf = mbufc;/* current mbuf within the chain */
+ 	int gnt_idx = 0;		/* index into grant table */
++	int map_idx = 0;		/* index into grant table for mappings */
+ 	RING_IDX r_idx = pkt->car;	/* index into rx ring buffer */
+ 	int r_ofs = 0;	/* offset of next data within rx request's data area */
+ 	int m_ofs = 0;	/* offset of next data within mbuf's data area */
+ 	/* size in bytes that still needs to be represented in the table */
+ 	uint16_t size_remaining;
++	int use_persistent_gnt = (xnb->pgnt); /* support for persistent grants */
+ 
++	*n_pgnt = 0;
+ 	size_remaining = (xnb_pkt_is_valid(pkt) != 0) ? pkt->size : 0;
+ 
+ 	while (size_remaining > 0) {
+@@ -2003,22 +2490,36 @@ xnb_rxpkt2gnttab(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 		 * grant table's next entry
+ 		 */
+ 		const size_t space = MIN(pkt_space, mbuf_space);
++		struct persistent_gnt *persistent_gnt = NULL;
+ 
+ 		/* TODO: handle this error condition without panicing */
+ 		KASSERT(gnt_idx < GNTTAB_LEN, ("Grant table is too short"));
+ 
+-		gnttab[gnt_idx].dest.u.ref = rxq->gref;
+-		gnttab[gnt_idx].dest.domid = otherend_id;
+-		gnttab[gnt_idx].dest.offset = r_ofs;
+-		gnttab[gnt_idx].source.u.gmfn = virt_to_mfn(
+-		    mtod(mbuf, vm_offset_t) + m_ofs);
+-		gnttab[gnt_idx].source.offset = virt_to_offset(
+-		    mtod(mbuf, vm_offset_t) + m_ofs);
+-		gnttab[gnt_idx].source.domid = DOMID_SELF;
+-		gnttab[gnt_idx].len = space;
+-		gnttab[gnt_idx].flags = GNTCOPY_dest_gref;
++		if (use_persistent_gnt)
++			persistent_gnt = get_persistent_gnt(xnb, rxq->gref);
+ 
+-		gnt_idx++;
++		if (persistent_gnt) {
++			caddr_t kva = (caddr_t) persistent_gnt->addr;
++			m_copydata(mbuf, m_ofs, space, kva + r_ofs);
++			put_persistent_gnt(xnb, persistent_gnt);
++
++			gnttab[map_idx].dest.u.ref = rxq->gref;
++			gnttab[map_idx].len = space;
++			gnttab[map_idx].status = GNTST_okay;
++			map_idx++;
++		} else {
++			gnttab[gnt_idx].dest.u.ref = rxq->gref;
++			gnttab[gnt_idx].dest.domid = otherend_id;
++			gnttab[gnt_idx].dest.offset = r_ofs;
++			gnttab[gnt_idx].source.u.gmfn = virt_to_mfn(
++				mtod(mbuf, vm_offset_t) + m_ofs);
++			gnttab[gnt_idx].source.offset = virt_to_offset(
++				mtod(mbuf, vm_offset_t) + m_ofs);
++			gnttab[gnt_idx].source.domid = DOMID_SELF;
++			gnttab[gnt_idx].len = space;
++			gnttab[gnt_idx].flags = GNTCOPY_dest_gref;
++			gnt_idx++;
++		}
+ 
+ 		r_ofs += space;
+ 		m_ofs += space;
+@@ -2034,7 +2535,7 @@ xnb_rxpkt2gnttab(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 			mbuf = mbuf->m_next;
+ 		}
+ 	}
+-
++	*n_pgnt = map_idx;
+ 	return gnt_idx;
+ }
+ 
+@@ -2361,7 +2862,7 @@ xnb_start_locked(struct ifnet *ifp)
+ 			IF_DEQUEUE(&ifp->if_snd, mbufc);
+ 			if (mbufc == NULL)
+ 				break;
+-			error = xnb_send(rxb, xnb->otherend_id, mbufc,
++			error = xnb_send(rxb, xnb->otherend_id, mbufc, ifp,
+ 			    		 xnb->rx_gnttab);
+ 			switch (error) {
+ 				case EAGAIN:
+@@ -2418,22 +2919,28 @@ xnb_start_locked(struct ifnet *ifp)
+  */
+ static int
+ xnb_send(netif_rx_back_ring_t *ring, domid_t otherend, const struct mbuf *mbufc,
+-	 gnttab_copy_table gnttab)
++	struct ifnet *ifnet, gnttab_copy_table gnttab)
+ {
+ 	struct xnb_pkt pkt;
+-	int error, n_entries, n_reqs;
++	struct xnb_softc *xnb = ifnet->if_softc;
++	int error, n_entries, n_pgnt, n_reqs;
+ 	RING_IDX space;
+ 
+ 	space = ring->sring->req_prod - ring->req_cons;
+ 	error = xnb_mbufc2pkt(mbufc, &pkt, ring->rsp_prod_pvt, space);
+ 	if (error != 0)
+ 		return error;
+-	n_entries = xnb_rxpkt2gnttab(&pkt, mbufc, gnttab, ring, otherend);
++	n_pgnt = xnb_rxpkt2gntmap(&pkt, mbufc, xnb->rx_gntmap, ring,
++						otherend, xnb);
++	n_entries = xnb_rxpkt2gnttab(&pkt, mbufc, gnttab, ring, otherend,
++			xnb, &n_pgnt);
+ 	if (n_entries != 0) {
+ 		int __unused hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy,
+ 		    gnttab, n_entries);
+ 		KASSERT(hv_ret == 0, ("HYPERVISOR_grant_table_op returned %d\n",
+ 		    hv_ret));
++	} else {
++		n_entries = n_pgnt;
+ 	}
+ 
+ 	n_reqs = xnb_rxpkt2rsp(&pkt, gnttab, n_entries, ring);
+diff --git a/sys/dev/xen/netback/netback_unit_tests.c b/sys/dev/xen/netback/netback_unit_tests.c
+index 390f9f7..08b31e6 100644
+--- a/sys/dev/xen/netback/netback_unit_tests.c
++++ b/sys/dev/xen/netback/netback_unit_tests.c
+@@ -186,6 +186,7 @@ static struct {
+ 	netif_tx_back_ring_t	txb;
+ 	netif_tx_front_ring_t	txf;
+ 	struct ifnet*		ifp;
++	struct xnb_softc* 	xnb;
+ 	netif_rx_sring_t*	rxs;
+ 	netif_tx_sring_t*	txs;
+ } xnb_unit_pvt;
+@@ -359,6 +360,10 @@ setup_pvt_data(void)
+ 		error = 1;
+ 	}
+ 
++	xnb_unit_pvt.xnb = malloc(sizeof(struct xnb_softc*), M_XENNETBACK, 
++					M_WAITOK|M_ZERO);
++	xnb_unit_pvt.xnb->pgnt = 0;
++
+ 	xnb_unit_pvt.rxs = malloc(PAGE_SIZE, M_XENNETBACK, M_WAITOK|M_ZERO);
+ 	if (xnb_unit_pvt.rxs != NULL) {
+ 		SHARED_RING_INIT(xnb_unit_pvt.rxs);
+@@ -1112,7 +1117,7 @@ xnb_txpkt2gnttab_empty(char *buffer, size_t buflen)
+ 	pkt.size = 0;
+ 	pMbuf = xnb_pkt2mbufc(&pkt, xnb_unit_pvt.ifp);
+ 	n_entries = xnb_txpkt2gnttab(&pkt, pMbuf, xnb_unit_pvt.gnttab,
+-	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED);
++	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb);
+ 	XNB_ASSERT(n_entries == 0);
+ 	safe_m_freem(&pMbuf);
+ }
+@@ -1143,7 +1148,7 @@ xnb_txpkt2gnttab_short(char *buffer, size_t buflen)
+ 
+ 	pMbuf = xnb_pkt2mbufc(&pkt, xnb_unit_pvt.ifp);
+ 	n_entries = xnb_txpkt2gnttab(&pkt, pMbuf, xnb_unit_pvt.gnttab,
+-	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED);
++	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb);
+ 	XNB_ASSERT(n_entries == 1);
+ 	XNB_ASSERT(xnb_unit_pvt.gnttab[0].len == size);
+ 	/* flags should indicate gref's for source */
+@@ -1191,7 +1196,7 @@ xnb_txpkt2gnttab_2req(char *buffer, size_t buflen)
+ 
+ 	pMbuf = xnb_pkt2mbufc(&pkt, xnb_unit_pvt.ifp);
+ 	n_entries = xnb_txpkt2gnttab(&pkt, pMbuf, xnb_unit_pvt.gnttab,
+-	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED);
++	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb);
+ 
+ 	XNB_ASSERT(n_entries == 2);
+ 	XNB_ASSERT(xnb_unit_pvt.gnttab[0].len == 1400);
+@@ -1228,7 +1233,7 @@ xnb_txpkt2gnttab_2cluster(char *buffer, size_t buflen)
+ 
+ 	pMbuf = xnb_pkt2mbufc(&pkt, xnb_unit_pvt.ifp);
+ 	n_entries = xnb_txpkt2gnttab(&pkt, pMbuf, xnb_unit_pvt.gnttab,
+-	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED);
++	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb);
+ 
+ 	if (M_TRAILINGSPACE(pMbuf) == MCLBYTES) {
+ 		/* there should be three mbufs and three gnttab entries */
+@@ -1301,7 +1306,7 @@ xnb_update_mbufc_short(char *buffer, size_t buflen)
+ 
+ 	pMbuf = xnb_pkt2mbufc(&pkt, xnb_unit_pvt.ifp);
+ 	n_entries = xnb_txpkt2gnttab(&pkt, pMbuf, xnb_unit_pvt.gnttab,
+-	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED);
++	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb);
+ 
+ 	/* Update grant table's status fields as the hypervisor call would */
+ 	xnb_unit_pvt.gnttab[0].status = GNTST_okay;
+@@ -1345,7 +1350,7 @@ xnb_update_mbufc_2req(char *buffer, size_t buflen)
+ 
+ 	pMbuf = xnb_pkt2mbufc(&pkt, xnb_unit_pvt.ifp);
+ 	n_entries = xnb_txpkt2gnttab(&pkt, pMbuf, xnb_unit_pvt.gnttab,
+-	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED);
++	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb);
+ 
+ 	/* Update grant table's status fields as the hypervisor call would */
+ 	xnb_unit_pvt.gnttab[0].status = GNTST_okay;
+@@ -1384,7 +1389,7 @@ xnb_update_mbufc_2cluster(char *buffer, size_t buflen)
+ 
+ 	pMbuf = xnb_pkt2mbufc(&pkt, xnb_unit_pvt.ifp);
+ 	n_entries = xnb_txpkt2gnttab(&pkt, pMbuf, xnb_unit_pvt.gnttab,
+-	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED);
++	    &xnb_unit_pvt.txb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb);
+ 
+ 	/* Update grant table's status fields */
+ 	for (i = 0; i < n_entries; i++) {
+@@ -1646,7 +1651,7 @@ static void
+ xnb_rxpkt2gnttab_empty(char *buffer, size_t buflen)
+ {
+ 	struct xnb_pkt pkt;
+-	int nr_entries;
++	int nr_entries, nr_pgnts;
+ 	int free_slots = 60;
+ 	struct mbuf *mbuf;
+ 
+@@ -1654,7 +1659,8 @@ xnb_rxpkt2gnttab_empty(char *buffer, size_t buflen)
+ 
+ 	xnb_mbufc2pkt(mbuf, &pkt, 0, free_slots);
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbuf, xnb_unit_pvt.gnttab,
+-			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++			&nr_pgnts);
+ 
+ 	XNB_ASSERT(nr_entries == 0);
+ 
+@@ -1665,7 +1671,7 @@ xnb_rxpkt2gnttab_empty(char *buffer, size_t buflen)
+ static void
+ xnb_rxpkt2gnttab_short(char *buffer, size_t buflen) {
+ 	struct xnb_pkt pkt;
+-	int nr_entries;
++	int nr_entries, nr_pgnts;
+ 	size_t size = 128;
+ 	int free_slots = 60;
+ 	RING_IDX start = 9;
+@@ -1683,7 +1689,8 @@ xnb_rxpkt2gnttab_short(char *buffer, size_t buflen) {
+ 	req->gref = 7;
+ 
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbuf, xnb_unit_pvt.gnttab,
+-				      &xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++				      &xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++					  &nr_pgnts);
+ 
+ 	XNB_ASSERT(nr_entries == 1);
+ 	XNB_ASSERT(xnb_unit_pvt.gnttab[0].len == size);
+@@ -1707,7 +1714,7 @@ static void
+ xnb_rxpkt2gnttab_2req(char *buffer, size_t buflen)
+ {
+ 	struct xnb_pkt pkt;
+-	int nr_entries;
++	int nr_entries, nr_pgnts;
+ 	int i, num_mbufs;
+ 	size_t total_granted_size = 0;
+ 	size_t size = MJUMPAGESIZE + 1;
+@@ -1732,7 +1739,8 @@ xnb_rxpkt2gnttab_2req(char *buffer, size_t buflen)
+ 	num_mbufs = i;
+ 
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbuf, xnb_unit_pvt.gnttab,
+-			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++			&nr_pgnts);
+ 
+ 	XNB_ASSERT(nr_entries >= num_mbufs);
+ 	for (i = 0; i < nr_entries; i++) {
+@@ -1753,6 +1761,7 @@ xnb_rxpkt2rsp_empty(char *buffer, size_t buflen)
+ 	struct xnb_pkt pkt;
+ 	int nr_entries;
+ 	int nr_reqs;
++	int nr_pgnts;
+ 	int free_slots = 60;
+ 	netif_rx_back_ring_t rxb_backup = xnb_unit_pvt.rxb;
+ 	netif_rx_sring_t rxs_backup = *xnb_unit_pvt.rxs;
+@@ -1762,7 +1771,8 @@ xnb_rxpkt2rsp_empty(char *buffer, size_t buflen)
+ 
+ 	xnb_mbufc2pkt(mbuf, &pkt, 0, free_slots);
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbuf, xnb_unit_pvt.gnttab,
+-			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++			&nr_pgnts);
+ 
+ 	nr_reqs = xnb_rxpkt2rsp(&pkt, xnb_unit_pvt.gnttab, nr_entries,
+ 	    &xnb_unit_pvt.rxb);
+@@ -1782,7 +1792,7 @@ static void
+ xnb_rxpkt2rsp_short(char *buffer, size_t buflen)
+ {
+ 	struct xnb_pkt pkt;
+-	int nr_entries, nr_reqs;
++	int nr_entries, nr_reqs, nr_pgnts;
+ 	size_t size = 128;
+ 	int free_slots = 60;
+ 	RING_IDX start = 5;
+@@ -1804,7 +1814,8 @@ xnb_rxpkt2rsp_short(char *buffer, size_t buflen)
+ 	xnb_unit_pvt.rxs->rsp_prod = start;
+ 
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbuf, xnb_unit_pvt.gnttab,
+-			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++			&nr_pgnts);
+ 
+ 	nr_reqs = xnb_rxpkt2rsp(&pkt, xnb_unit_pvt.gnttab, nr_entries,
+ 	    &xnb_unit_pvt.rxb);
+@@ -1827,7 +1838,7 @@ static void
+ xnb_rxpkt2rsp_extra(char *buffer, size_t buflen)
+ {
+ 	struct xnb_pkt pkt;
+-	int nr_entries, nr_reqs;
++	int nr_entries, nr_reqs, nr_pgnts;
+ 	size_t size = 14;
+ 	int free_slots = 15;
+ 	RING_IDX start = 3;
+@@ -1864,7 +1875,8 @@ xnb_rxpkt2rsp_extra(char *buffer, size_t buflen)
+ 	xnb_unit_pvt.rxs->rsp_prod = start;
+ 
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbufc, xnb_unit_pvt.gnttab,
+-			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++			&nr_pgnts);
+ 
+ 	nr_reqs = xnb_rxpkt2rsp(&pkt, xnb_unit_pvt.gnttab, nr_entries,
+ 	    &xnb_unit_pvt.rxb);
+@@ -1897,7 +1909,7 @@ static void
+ xnb_rxpkt2rsp_2slots(char *buffer, size_t buflen)
+ {
+ 	struct xnb_pkt pkt;
+-	int nr_entries, nr_reqs;
++	int nr_entries, nr_reqs, nr_pgnts;
+ 	size_t size = PAGE_SIZE + 100;
+ 	int free_slots = 3;
+ 	uint16_t id1 = 17;
+@@ -1934,7 +1946,8 @@ xnb_rxpkt2rsp_2slots(char *buffer, size_t buflen)
+ 	xnb_unit_pvt.rxs->rsp_prod = start;
+ 
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbuf, xnb_unit_pvt.gnttab,
+-			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++			&nr_pgnts);
+ 
+ 	nr_reqs = xnb_rxpkt2rsp(&pkt, xnb_unit_pvt.gnttab, nr_entries,
+ 	    &xnb_unit_pvt.rxb);
+@@ -1962,7 +1975,7 @@ xnb_rxpkt2rsp_2slots(char *buffer, size_t buflen)
+ static void
+ xnb_rxpkt2rsp_2short(char *buffer, size_t buflen) {
+ 	struct xnb_pkt pkt;
+-	int nr_reqs, nr_entries;
++	int nr_reqs, nr_entries, nr_pgnts;
+ 	size_t size1 = MHLEN - 5;
+ 	size_t size2 = MHLEN - 15;
+ 	int free_slots = 32;
+@@ -1997,7 +2010,8 @@ xnb_rxpkt2rsp_2short(char *buffer, size_t buflen) {
+ 	xnb_unit_pvt.rxs->rsp_prod = start;
+ 
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbufc, xnb_unit_pvt.gnttab,
+-			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++			&nr_pgnts);
+ 
+ 	nr_reqs = xnb_rxpkt2rsp(&pkt, xnb_unit_pvt.gnttab, nr_entries,
+ 	    &xnb_unit_pvt.rxb);
+@@ -2023,7 +2037,7 @@ static void
+ xnb_rxpkt2rsp_copyerror(char *buffer, size_t buflen)
+ {
+ 	struct xnb_pkt pkt;
+-	int nr_entries, nr_reqs;
++	int nr_entries, nr_reqs, nr_pgnts;
+ 	int id = 7;
+ 	int gref = 42;
+ 	uint16_t canary = 6859;
+@@ -2052,7 +2066,8 @@ xnb_rxpkt2rsp_copyerror(char *buffer, size_t buflen)
+ 	req->id = canary;
+ 
+ 	nr_entries = xnb_rxpkt2gnttab(&pkt, mbuf, xnb_unit_pvt.gnttab,
+-			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED);
++			&xnb_unit_pvt.rxb, DOMID_FIRST_RESERVED, xnb_unit_pvt.xnb,
++			&nr_pgnts);
+ 	/* Inject the error*/
+ 	xnb_unit_pvt.gnttab[2].status = GNTST_general_error;
+ 
+-- 
+1.9.0
+

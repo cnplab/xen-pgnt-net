@@ -1,0 +1,39 @@
+From f64fdadc54dfc697c170f4dcde6d61ccc3fc20f0 Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Sat, 18 Apr 2015 15:56:59 +0000
+Subject: [RFC PATCH 07/13] xen-netback: add persistent tree counters to
+ debugfs
+
+Prints the total/max number of persistent grants and how many of
+them are in use.
+
+Signed-off-by: Joao Martins <joao.martins@neclab.eu>
+---
+ drivers/net/xen-netback/xenbus.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/net/xen-netback/xenbus.c b/drivers/net/xen-netback/xenbus.c
+index 766f7e5..1e6f27a 100644
+--- a/drivers/net/xen-netback/xenbus.c
++++ b/drivers/net/xen-netback/xenbus.c
+@@ -121,6 +121,17 @@ static int xenvif_read_io_ring(struct seq_file *m, void *v)
+ 		   skb_queue_len(&queue->rx_queue),
+ 		   netif_tx_queue_stopped(dev_queue) ? "stopped" : "running");
+ 
++	if (queue->vif->persistent_grants) {
++		seq_printf(m, "\nRx persistent_gnts: in_use %d max %d gnts %d\n",
++			   atomic_read(&queue->rx_gnts_tree.gnt_in_use),
++			   queue->rx_gnts_tree.gnt_max,
++			   queue->rx_gnts_tree.gnt_c);
++		seq_printf(m, "\nTx persistent_gnts: in_use %d max %d gnts %d\n",
++			   atomic_read(&queue->tx_gnts_tree.gnt_in_use),
++			   queue->tx_gnts_tree.gnt_max,
++			   queue->tx_gnts_tree.gnt_c);
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.1.3
+

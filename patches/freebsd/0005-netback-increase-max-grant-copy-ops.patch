@@ -1,0 +1,25 @@
+From 85c88a3431d5dcc9fb5d534c1d8296131ef5cceb Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Mon, 29 Sep 2014 00:15:07 +0000
+Subject: [PATCH 5/7] netback: increase max grant copy ops
+
+---
+ sys/dev/xen/netback/netback.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sys/dev/xen/netback/netback.c b/sys/dev/xen/netback/netback.c
+index 2d046c3..b82049d 100644
+--- a/sys/dev/xen/netback/netback.c
++++ b/sys/dev/xen/netback/netback.c
+@@ -124,7 +124,7 @@ static MALLOC_DEFINE(M_XENNETBACK, "xnb", "Xen Net Back Driver Data");
+ #endif
+ 
+ /* Default length for stack-allocated grant tables */
+-#define	GNTTAB_LEN	(64)
++#define	GNTTAB_LEN	(256)
+ 
+ /* Number of available flags */
+ #define PERSISTENT_GNT_FLAGS_SIZE	2
+-- 
+1.9.0
+

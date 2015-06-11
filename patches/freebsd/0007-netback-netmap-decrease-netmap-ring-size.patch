@@ -1,0 +1,31 @@
+From 20f3eabf019731b759cd5be20c52dab74042e47a Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Fri, 10 Oct 2014 13:15:11 +0000
+Subject: [PATCH 7/7] netback: netmap: decrease netmap ring size
+
+In most of cases, using the full batch leads to worse performance,
+when the consumer is too fast. In Xen case, ring size is 256 and
+we set it to the next power of 2. While it performs better
+12.5 vs 7 Mpps, we still need to have a better notification criteria.
+---
+ sys/dev/netmap/if_xnb_netmap.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/sys/dev/netmap/if_xnb_netmap.h b/sys/dev/netmap/if_xnb_netmap.h
+index e449c25..620dd57 100644
+--- a/sys/dev/netmap/if_xnb_netmap.h
++++ b/sys/dev/netmap/if_xnb_netmap.h
+@@ -469,8 +469,8 @@ xnb_netmap_attach(struct xnb_softc *xnb)
+ 	bzero(&na, sizeof(na));
+ 
+ 	na.ifp = xnb->xnb_ifp;
+-	na.num_tx_desc = NET_TX_RING_SIZE;
+-	na.num_rx_desc = NET_RX_RING_SIZE;
++	na.num_tx_desc = (NET_RX_RING_SIZE>>1);
++	na.num_rx_desc = (NET_TX_RING_SIZE>>1);
+ 	na.nm_register = xnb_netmap_reg;
+ 	na.nm_txsync = xnb_netmap_txsync;
+ 	na.nm_rxsync = xnb_netmap_rxsync;
+-- 
+1.9.0
+

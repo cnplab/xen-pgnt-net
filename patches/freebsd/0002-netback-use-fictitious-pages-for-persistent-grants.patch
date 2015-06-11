@@ -1,0 +1,250 @@
+From eeb2aa4aa8597a8ea908ea1baa991212342a8480 Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Wed, 24 Sep 2014 12:50:22 +0000
+Subject: [PATCH 2/7] netback: use fictitious pages for persistent grants
+
+---
+ sys/dev/xen/netback/netback.c | 69 ++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 58 insertions(+), 11 deletions(-)
+
+diff --git a/sys/dev/xen/netback/netback.c b/sys/dev/xen/netback/netback.c
+index 1d44baa..123f361 100644
+--- a/sys/dev/xen/netback/netback.c
++++ b/sys/dev/xen/netback/netback.c
+@@ -82,6 +82,9 @@ __FBSDID("$FreeBSD$");
+ #include <vm/pmap.h>
+ #include <vm/vm_extern.h>
+ #include <vm/vm_kern.h>
++#include <vm/vm_param.h>
++#include <vm/vm_page.h>
++#include <vm/vm_phys.h>
+ 
+ #include <machine/_inttypes.h>
+ 
+@@ -133,6 +136,8 @@ static MALLOC_DEFINE(M_XENNETBACK, "xnb", "Xen Net Back Driver Data");
+ 
+ #define PERSISTENT_GNT_MAX			1024
+ 
++#define PERSISTENT_GNT_MAP_SIZE		(PAGE_SIZE * PERSISTENT_GNT_MAX)
++
+ /* Features supported by all backends.  TSO and LRO can be negotiated */
+ #define	XNB_CSUM_FEATURES	(CSUM_TCP | CSUM_UDP)
+ 
+@@ -176,7 +181,7 @@ static int	create_netdev(device_t dev);
+ static int	xnb_detach(device_t dev);
+ static int	xnb_ifmedia_upd(struct ifnet *ifp);
+ static void	xnb_ifmedia_sts(struct ifnet *ifp, struct ifmediareq *ifmr);
+-static void 	xnb_intr(void *arg);
++static void	xnb_intr(void *arg);
+ static int	xnb_send(netif_rx_back_ring_t *rxb, domid_t otherend,
+ 			 const struct mbuf *mbufc, struct ifnet *ifnet,
+ 			 gnttab_copy_table gnttab);
+@@ -377,6 +382,9 @@ struct xnb_ring_config {
+ 	/** The pseudo-physical address where ring memory is mapped.*/
+ 	uint64_t	gnt_addr;
+ 
++	/** The pseudo-physical address where ring memory is mapped.*/
++	uint64_t	map_addr;
++
+ 	/** KVA address where ring memory is mapped. */
+ 	vm_offset_t	va;
+ 
+@@ -390,6 +398,9 @@ struct xnb_ring_config {
+ 	/** The number of ring pages mapped for the current connection. */
+ 	unsigned	ring_pages;
+ 
++	/** The number of grants in use */
++	unsigned int	map_pages;
++
+ 	/**
+ 	 * The grant references, one per-ring page, supplied by the
+ 	 * front-end, allowing us to reference the ring pages in the
+@@ -468,7 +479,7 @@ struct xnb_softc {
+ 	struct ifmedia		sc_media;
+ 
+ 	/** Media carrier info */
+-	struct ifnet 		*xnb_ifp;
++	struct ifnet		*xnb_ifp;
+ 
+ 	/** Our own private carrier state */
+ 	unsigned carrier;
+@@ -500,7 +511,7 @@ struct xnb_softc {
+ 	evtchn_port_t		evtchn;
+ 
+ 	/** Xen device handle.*/
+-	long 			handle;
++	long			handle;
+ 
+ 	/** Handle to the communication ring event channel. */
+ 	xen_intr_handle_t	xen_intr_handle;
+@@ -554,6 +565,13 @@ struct xnb_softc {
+ 	gnttab_map_table	tx_gntmap;
+ 
+ 	/**
++	 * Resource representing allocated fictitious address space
++	 * for persistently mapped pages.
++	 */
++	struct resource		*pmap_pseudo_phys_res;
++	/** Resource id for allocated physical address space. */
++	int			pmap_pseudo_phys_res_id;
++	/**
+ 	 * Red Black tree to store persistent grants
+ 	 *
+ 	 */
+@@ -587,6 +605,9 @@ struct xnb_softc {
+ 	/** Psuedo-physical address corresponding to kva. */
+ 	uint64_t		gnt_base_addr;
+ 
++	/** Pseudo-physical address corresponding to kva. */
++	uint64_t		pmap_base_addr;
++
+ 	/** Various configuration and state bit flags. */
+ 	xnb_flag_t		flags;
+ 
+@@ -838,9 +859,18 @@ xnb_free_communication_mem(struct xnb_softc *xnb)
+ 			xnb->pseudo_phys_res = NULL;
+ 		}
+ #endif /* XENHVM */
++		vm_phys_fictitious_unreg_range(xnb->pmap_base_addr,
++				xnb->pmap_base_addr + 2*PERSISTENT_GNT_MAP_SIZE);
++		if (xnb->pmap_pseudo_phys_res != NULL) {
++			bus_release_resource(xnb->dev, SYS_RES_MEMORY,
++			    xnb->pmap_pseudo_phys_res_id,
++			    xnb->pmap_pseudo_phys_res);
++			xnb->pmap_pseudo_phys_res = NULL;
++		}
+ 	}
+ 	xnb->kva = 0;
+ 	xnb->gnt_base_addr = 0;
++	xnb->pmap_base_addr = 0;
+ }
+ 
+ /**
+@@ -908,7 +938,7 @@ xnb_disconnect(struct xnb_softc *xnb)
+  *
+  * \param xnb	Per-instance xnb configuration structure
+  * \param ring_type	Array index of this ring in the xnb's array of rings
+- * \return 	An errno
++ * \return	An errno
+  */
+ static int
+ xnb_connect_ring(struct xnb_softc *xnb, xnb_ring_type_t ring_type)
+@@ -926,6 +956,7 @@ xnb_connect_ring(struct xnb_softc *xnb, xnb_ring_type_t ring_type)
+ 	/* TX ring type = 0, RX =1 */
+ 	ring->va = xnb->kva + ring_type * PAGE_SIZE;
+ 	ring->gnt_addr = xnb->gnt_base_addr + ring_type * PAGE_SIZE;
++	ring->map_addr = xnb->pmap_base_addr + ring_type * PERSISTENT_GNT_MAP_SIZE;
+ 
+ 	gnt.host_addr = ring->gnt_addr;
+ 	gnt.flags     = GNTMAP_host_map;
+@@ -985,7 +1016,7 @@ xnb_connect_comms(struct xnb_softc *xnb)
+ 	for (i=0; i < XNB_NUM_RING_TYPES; i++) {
+ 		error = xnb_connect_ring(xnb, i);
+ 		if (error != 0)
+-	  		return error;
++			return error;
+ 	}
+ 
+ 	xnb->flags |= XNBF_RING_CONNECTED;
+@@ -1022,6 +1053,7 @@ static int
+ xnb_alloc_communication_mem(struct xnb_softc *xnb)
+ {
+ 	xnb_ring_type_t i;
++	int err;
+ 
+ 	xnb->kva_size = 0;
+ 	for (i=0; i < XNB_NUM_RING_TYPES; i++) {
+@@ -1032,6 +1064,7 @@ xnb_alloc_communication_mem(struct xnb_softc *xnb)
+ 	if (xnb->kva == 0)
+ 		return (ENOMEM);
+ 	xnb->gnt_base_addr = xnb->kva;
++	xnb->pmap_pseudo_phys_res_id = 0;
+ #else /* defined XENHVM */
+ 	/*
+ 	 * Reserve a range of pseudo physical memory that we can map
+@@ -1051,7 +1084,16 @@ xnb_alloc_communication_mem(struct xnb_softc *xnb)
+ 	}
+ 	xnb->kva = (vm_offset_t)rman_get_virtual(xnb->pseudo_phys_res);
+ 	xnb->gnt_base_addr = rman_get_start(xnb->pseudo_phys_res);
++	xnb->pmap_pseudo_phys_res_id = 1;
+ #endif /* !defined XENHVM */
++	xnb->pmap_pseudo_phys_res = bus_alloc_resource(xnb->dev, SYS_RES_MEMORY,
++						  &xnb->pmap_pseudo_phys_res_id,
++						  0, ~0, 2*PERSISTENT_GNT_MAP_SIZE,
++						  RF_ACTIVE);
++	xnb->pmap_base_addr = (vm_offset_t) rman_get_virtual(xnb->pmap_pseudo_phys_res);
++	err = vm_phys_fictitious_reg_range(xnb->pmap_base_addr,
++				xnb->pmap_base_addr + 2*PERSISTENT_GNT_MAP_SIZE, 0);
++	KASSERT(err == 0, ("Cannot allocate fictitious mapping"));
+ 	return (0);
+ }
+ 
+@@ -1959,6 +2001,7 @@ xnb_txpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ {
+ 
+ 	const struct mbuf *mbuf = mbufc;/* current mbuf within the chain */
++	struct xnb_ring_config *config = &xnb->ring_configs[XNB_RING_TYPE_TX];
+ 	int gnt_idx = 0;		/* index into grant table */
+ 	RING_IDX r_idx = pkt->car;	/* index into tx ring buffer */
+ 	int r_ofs = 0;	/* offset of next data within tx request's data area */
+@@ -1966,7 +2009,7 @@ xnb_txpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 	int size_remaining = pkt->size;	/* size in bytes that still needs to be represented in the table */
+ 	int err, i;
+ 	uint64_t map[GNTTAB_LEN];
+-
++	
+ 	if (!xnb->pgnt)
+ 		return 0;
+ 
+@@ -1990,9 +2033,8 @@ xnb_txpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 		if (!persistent_gnt) {
+ 			uint64_t addr;
+ 
+-			addr = (uint64_t) contigmalloc(PAGE_SIZE, M_XENNETBACK,
+-							M_NOWAIT | M_ZERO, (size_t)0, -1UL, PAGE_SIZE, 0);
+-
++			addr = (uint64_t) config->map_addr + 
++					(PAGE_SIZE * (config->map_pages + gnt_idx));
+ 			if (!addr) {
+ 				DPRINTF("No memory for persistent grants\n");
+ 				return -ENOMEM;
+@@ -2054,6 +2096,8 @@ xnb_txpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 			continue;
+ 		}
+ 
++		config->map_pages++;
++
+ 		DPRINTF("Mapping %d gref from domain %d\n", persistent_gnt->ref, otherend_id);
+ 	}
+ 
+@@ -2347,6 +2391,7 @@ xnb_rxpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ {
+ 
+ 	const struct mbuf *mbuf = mbufc;/* current mbuf within the chain */
++	struct xnb_ring_config *config = &xnb->ring_configs[XNB_RING_TYPE_RX];
+ 	int gnt_idx = 0;		/* index into grant table */
+ 	RING_IDX r_idx = pkt->car;	/* index into tx ring buffer */
+ 	int r_ofs = 0;	/* offset of next data within tx request's data area */
+@@ -2377,8 +2422,8 @@ xnb_rxpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 		if (!persistent_gnt) {
+ 			uint64_t addr;
+ 
+-			addr = (uint64_t) contigmalloc(PAGE_SIZE, M_XENNETBACK,
+-							M_NOWAIT | M_ZERO, (size_t)0, -1UL, PAGE_SIZE, 0);
++			addr = (uint64_t) config->map_addr + 
++					(PAGE_SIZE * (config->map_pages + gnt_idx));
+ 
+ 			if (!addr) {
+ 				DPRINTF("No memory for persistent grants\n");
+@@ -2441,6 +2486,8 @@ xnb_rxpkt2gntmap(const struct xnb_pkt *pkt, const struct mbuf *mbufc,
+ 			continue;
+ 		}
+ 
++		config->map_pages++;
++
+ 		DPRINTF("Mapping %d gref from domain %d\n", persistent_gnt->ref, otherend_id);
+ 	}
+ 
+-- 
+1.9.0
+

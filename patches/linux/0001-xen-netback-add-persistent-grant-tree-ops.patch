@@ -1,0 +1,269 @@
+From 257b64e6cf5581f91e783b760d5f21340869571b Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Wed, 22 Apr 2015 08:59:49 +0000
+Subject: [RFC PATCH 01/13] xen-netback: add persistent grant tree ops
+
+Implement the necessary routines for managing the grant tree. These
+routines are ported from blkback driver and slightly modified to be
+more generic. This patch is separated because it relates to code that
+could be shared with other drivers, in case persistent grants are adopted.
+
+The changes compared to blkback are: declaring a struct persistent_gnt_tree
+to store grant tree info so that these routines are called with a tree
+argument rather than a driver private data structure. It has a pool of
+free pages that should be used for grant maps to be added to the tree.
+We can't sleep on xenvif_tx_action/xenvif_start_xmit, so this pool is
+prefilled with xen ballooned pages when initializing the tree.
+
+Regarding *_persistent_gnt API changes: get_persistent_gnt() will return
+ERR_PTR(-EBUSY) if we try to fetch an already in use grant ref. This is
+useful on netback case so that we fallback to map/unmap in case we try to
+fetch an already  in use grant. This way we save a map (plus unmap on
+error) and prevent the error on add_persistent_gnt that would also lead
+towards dropping the packet.
+
+Signed-off-by: Joao Martins <joao.martins@neclab.eu>
+---
+ drivers/net/xen-netback/common.h  |  57 +++++++++++++++
+ drivers/net/xen-netback/netback.c | 145 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 202 insertions(+)
+
+diff --git a/drivers/net/xen-netback/common.h b/drivers/net/xen-netback/common.h
+index 8a495b3..dd02386 100644
+--- a/drivers/net/xen-netback/common.h
++++ b/drivers/net/xen-netback/common.h
+@@ -106,6 +106,48 @@ struct xenvif_rx_meta {
+ /* IRQ name is queue name with "-tx" or "-rx" appended */
+ #define IRQ_NAME_SIZE (QUEUE_NAME_SIZE + 3)
+ 
++/* Number of available flags */
++#define PERSISTENT_GNT_FLAGS_SIZE      2
++/* This persistent grant is currently in use */
++#define PERSISTENT_GNT_ACTIVE          0
++/* This persistent grant has been used, this flag is set when we remove the
++ * PERSISTENT_GNT_ACTIVE, to know that this grant has been used recently.
++ */
++#define PERSISTENT_GNT_WAS_ACTIVE      1
++
++struct persistent_gnt {
++	struct page *page; /* mapped page */
++	grant_ref_t gnt;
++	grant_handle_t handle;
++	DECLARE_BITMAP(flags, PERSISTENT_GNT_FLAGS_SIZE);
++	struct rb_node node;
++};
++
++struct persistent_gnt_tree {
++	/* Tree to store persistent grants */
++	struct rb_root root;
++
++	/* Number of grants in use */
++	atomic_t gnt_in_use;
++
++	/* Number of grants in the tree */
++	unsigned int gnt_c;
++
++	/* Maximum number of grants in the tree */
++	unsigned int gnt_max;
++
++	/* True if we reached maximum number of
++	 * persistent grants in the tree
++	 */
++	bool overflow;
++
++	/* Free pages for grant maps */
++	struct list_head free_pages;
++
++	/* Initialized with <gnt_max> pages */
++	unsigned int free_pages_num;
++};
++
+ struct xenvif;
+ 
+ struct xenvif_stats {
+@@ -224,6 +266,7 @@ struct xenvif {
+ 	u8 can_sg:1;
+ 	u8 ip_csum:1;
+ 	u8 ipv6_csum:1;
++	u8 persistent_grants:1;
+ 
+ 	/* Is this interface disabled? True when backend discovers
+ 	 * frontend is rogue.
+@@ -344,4 +387,18 @@ void xenvif_skb_zerocopy_prepare(struct xenvif_queue *queue,
+ 				 struct sk_buff *skb);
+ void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue);
+ 
++/* tree ops for persistent grants */
++struct persistent_gnt *get_persistent_gnt(struct persistent_gnt_tree *tree,
++					  grant_ref_t gref);
++int add_persistent_gnt(struct persistent_gnt_tree *tree,
++		       struct persistent_gnt *persistent_gnt);
++void put_persistent_gnt(struct persistent_gnt_tree *tree,
++			struct persistent_gnt *persistent_gnt);
++void free_persistent_gnts(struct persistent_gnt_tree *tree, unsigned int num);
++/* Gets one page from the free pool in the tree */
++int get_free_page(struct persistent_gnt_tree *tree, struct page **page);
++/* Adds pages to the free pool in the tree */
++void put_free_pages(struct persistent_gnt_tree *tree, struct page **page,
++		    int num);
++
+ #endif /* __XEN_NETBACK__COMMON_H__ */
+diff --git a/drivers/net/xen-netback/netback.c b/drivers/net/xen-netback/netback.c
+index 4de46aa..8df0a73 100644
+--- a/drivers/net/xen-netback/netback.c
++++ b/drivers/net/xen-netback/netback.c
+@@ -107,6 +107,151 @@ static struct xen_netif_rx_response *make_rx_response(struct xenvif_queue *queue
+ 					     u16      size,
+ 					     u16      flags);
+ 
++#define foreach_grant_safe(pos, n, rbtree, node) \
++	for ((pos) = container_of(rb_first((rbtree)), typeof(*(pos)), node), \
++	     (n) = (&(pos)->node) ? rb_next(&(pos)->node) : NULL; \
++	     &(pos)->node; \
++	     (pos) = container_of(n, typeof(*(pos)), node), \
++	     (n) = (&(pos)->node) ? rb_next(&(pos)->node) : NULL)
++
++int add_persistent_gnt(struct persistent_gnt_tree *tree,
++		       struct persistent_gnt *persistent_gnt)
++{
++	struct rb_node **new = NULL, *parent = NULL;
++	struct persistent_gnt *this;
++
++	if (tree->gnt_c >= tree->gnt_max) {
++		pr_err("Using maximum number of peristent grants\n");
++		tree->overflow = true;
++		return -EBUSY;
++	}
++	/* Figure out where to put new node */
++	new = &tree->root.rb_node;
++	while (*new) {
++		this = container_of(*new, struct persistent_gnt, node);
++
++		parent = *new;
++		if (persistent_gnt->gnt < this->gnt) {
++			new = &((*new)->rb_left);
++		} else if (persistent_gnt->gnt > this->gnt) {
++			new = &((*new)->rb_right);
++		} else {
++			pr_err("Trying to add a gref that's already in the tree\n");
++			return -EINVAL;
++		}
++	}
++
++	bitmap_zero(persistent_gnt->flags, PERSISTENT_GNT_FLAGS_SIZE);
++	set_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags);
++	/* Add new node and rebalance tree. */
++	rb_link_node(&persistent_gnt->node, parent, new);
++	rb_insert_color(&persistent_gnt->node, &tree->root);
++	tree->gnt_c++;
++	atomic_inc(&tree->gnt_in_use);
++	return 0;
++}
++
++struct persistent_gnt *get_persistent_gnt(struct persistent_gnt_tree *tree,
++					  grant_ref_t gref)
++{
++	struct persistent_gnt *data;
++	struct rb_node *node = NULL;
++
++	node = tree->root.rb_node;
++	while (node) {
++		data = container_of(node, struct persistent_gnt, node);
++
++		if (gref < data->gnt) {
++			node = node->rb_left;
++		} else if (gref > data->gnt) {
++			node = node->rb_right;
++		} else {
++			if (test_bit(PERSISTENT_GNT_ACTIVE, data->flags)) {
++				pr_err("Requesting a grant already in use\n");
++				return ERR_PTR(-EBUSY);
++			}
++			set_bit(PERSISTENT_GNT_ACTIVE, data->flags);
++			atomic_inc(&tree->gnt_in_use);
++			return data;
++		}
++	}
++	return NULL;
++}
++
++void put_persistent_gnt(struct persistent_gnt_tree *tree,
++			struct persistent_gnt *persistent_gnt)
++{
++	if (!test_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags))
++		pr_alert("Freeing a grant already unused\n");
++	set_bit(PERSISTENT_GNT_WAS_ACTIVE, persistent_gnt->flags);
++	clear_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags);
++	atomic_dec(&tree->gnt_in_use);
++}
++
++void free_persistent_gnts(struct persistent_gnt_tree *tree, unsigned int num)
++
++{
++	struct gnttab_unmap_grant_ref unmap[FATAL_SKB_SLOTS_DEFAULT];
++	struct page *pages[FATAL_SKB_SLOTS_DEFAULT];
++	struct persistent_gnt *persistent_gnt;
++	struct rb_root *root = &tree->root;
++	struct rb_node *n;
++	int ret = 0;
++	int pages_to_unmap = 0;
++	void *addr;
++
++	foreach_grant_safe(persistent_gnt, n, root, node) {
++		BUG_ON(persistent_gnt->handle ==
++			NETBACK_INVALID_HANDLE);
++
++		addr = pfn_to_kaddr(page_to_pfn(persistent_gnt->page));
++		gnttab_set_unmap_op(&unmap[pages_to_unmap],
++				    (unsigned long)addr,
++				    GNTMAP_host_map | GNTMAP_readonly,
++				    persistent_gnt->handle);
++
++		pages[pages_to_unmap] = persistent_gnt->page;
++
++		if (++pages_to_unmap == FATAL_SKB_SLOTS_DEFAULT ||
++		    !rb_next(&persistent_gnt->node)) {
++			ret = gnttab_unmap_refs(unmap, NULL, pages,
++						pages_to_unmap);
++			BUG_ON(ret);
++			put_free_pages(tree, pages, pages_to_unmap);
++			pages_to_unmap = 0;
++		}
++
++		rb_erase(&persistent_gnt->node, root);
++		kfree(persistent_gnt);
++		num--;
++	}
++	BUG_ON(num != 0);
++}
++
++int get_free_page(struct persistent_gnt_tree *tree,
++		  struct page **page)
++{
++	if (list_empty(&tree->free_pages)) {
++		BUG_ON(tree->free_pages_num != 0);
++		return 1;
++	}
++	BUG_ON(tree->free_pages_num == 0);
++	page[0] = list_first_entry(&tree->free_pages, struct page, lru);
++	list_del(&page[0]->lru);
++	tree->free_pages_num--;
++	return 0;
++}
++
++void put_free_pages(struct persistent_gnt_tree *tree,
++		    struct page **page, int num)
++{
++	int i;
++
++	for (i = 0; i < num; i++)
++		list_add(&page[i]->lru, &tree->free_pages);
++	tree->free_pages_num += num;
++}
++
+ static inline unsigned long idx_to_pfn(struct xenvif_queue *queue,
+ 				       u16 idx)
+ {
+-- 
+2.1.3
+

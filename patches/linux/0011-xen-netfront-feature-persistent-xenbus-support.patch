@@ -1,0 +1,64 @@
+From feb9f5d6187b333a3ef2b32699a0e75e24bd3cf4 Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Wed, 25 Feb 2015 14:10:38 +0000
+Subject: [RFC PATCH 11/13] xen-netfront: feature-persistent xenbus support
+
+"feature-persistent" check on xenbus for persistent grants
+support on the backend.
+
+Signed-off-by: Joao Martins <joao.martins@neclab.eu>
+---
+ drivers/net/xen-netfront.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/drivers/net/xen-netfront.c b/drivers/net/xen-netfront.c
+index 99c17c9..7f44cc7 100644
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@ -162,6 +162,8 @@ struct netfront_info {
+ 	struct netfront_stats __percpu *tx_stats;
+ 
+ 	atomic_t rx_gso_checksum_fixup;
++
++	unsigned int feature_persistent:1;
+ };
+ 
+ struct netfront_rx_info {
+@@ -1919,6 +1921,12 @@ again:
+ 		goto abort_transaction;
+ 	}
+ 
++	err = xenbus_write(xbt, dev->nodename, "feature-persistent", "1");
++	if (err) {
++		message = "writing feature-persistent";
++		goto abort_transaction;
++	}
++
+ 	err = xenbus_transaction_end(xbt, 0);
+ 	if (err) {
+ 		if (err == -EAGAIN)
+@@ -1950,6 +1958,7 @@ static int xennet_connect(struct net_device *dev)
+ 	unsigned int num_queues = 0;
+ 	int err;
+ 	unsigned int feature_rx_copy;
++	unsigned int feature_persistent;
+ 	unsigned int j = 0;
+ 	struct netfront_queue *queue = NULL;
+ 
+@@ -1964,6 +1973,13 @@ static int xennet_connect(struct net_device *dev)
+ 		return -ENODEV;
+ 	}
+ 
++	err = xenbus_gather(XBT_NIL, np->xbdev->otherend,
++			    "feature-persistent", "%u", &feature_persistent,
++			    NULL);
++	if (err)
++		feature_persistent = 0;
++	np->feature_persistent = !!feature_persistent;
++
+ 	err = talk_to_netback(np->xbdev, np);
+ 	if (err)
+ 		return err;
+-- 
+2.1.3
+

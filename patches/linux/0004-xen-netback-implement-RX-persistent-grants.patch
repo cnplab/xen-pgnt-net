@@ -1,0 +1,385 @@
+From 5174104ffc450357b1bf53252678a4b98c21b3df Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Thu, 5 Mar 2015 09:43:26 +0000
+Subject: [RFC PATCH 04/13] xen-netback: implement RX persistent grants
+
+It starts by doing a lookup in the tree for a gref. If no persistent
+grant is found on the tree, it will do grant copy and prepare
+the grant maps. Finally valides the grant map and adds it to the tree.
+After mapped these grants can be pulled from the tree in the subsequent
+requests. If it's out of pages in the tree pool, it will fallback to
+grant copy.
+
+It adds four new fields in the netrx_pending_operations: copy_done
+to track how many copies were made; map_prod and map_cons to track
+how many maps are outstanding validation and finally copy_page for
+the correspondent page (in tree) for copy_gref.
+
+Results are 1.04 Mpps measured with pktgen (pkt_size 64, burst 1)
+with persistent grants versus 1.23 Mpps with grant copy (20%
+regression). With persistent grants it adds up contention on
+queue->wq as the kthread_guest_rx goes to sleep more often. If we
+speed up the sender (burst 2,4 and 8) it goes up to 1.7 Mpps with
+persistent grants. This issue is addressed in later a commit, by
+copying the skb on xenvif_start_xmit() instead of going through
+the RX kthread.
+
+Signed-off-by: Joao Martins <joao.martins@neclab.eu>
+---
+ drivers/net/xen-netback/common.h    |   7 ++
+ drivers/net/xen-netback/interface.c |  14 ++-
+ drivers/net/xen-netback/netback.c   | 190 ++++++++++++++++++++++++++++++------
+ 3 files changed, 178 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/net/xen-netback/common.h b/drivers/net/xen-netback/common.h
+index e5ee220..23deb6a 100644
+--- a/drivers/net/xen-netback/common.h
++++ b/drivers/net/xen-netback/common.h
+@@ -235,6 +235,13 @@ struct xenvif_queue { /* Per-queue data for xenvif */
+ 
+ 	struct gnttab_copy grant_copy_op[MAX_GRANT_COPY_OPS];
+ 
++	/* To map the grefs to be added to the tree */
++	struct gnttab_map_grant_ref rx_map_ops[XEN_NETIF_RX_RING_SIZE];
++	struct page *rx_pages_to_map[XEN_NETIF_RX_RING_SIZE];
++	/* Only used if feature-persistent = 1 */
++	struct persistent_gnt_tree rx_gnts_tree;
++	struct page *rx_gnts_pages[XEN_NETIF_RX_RING_SIZE];
++
+ 	/* We create one meta structure per ring request we consume, so
+ 	 * the maximum number is the same as the ring size.
+ 	 */
+diff --git a/drivers/net/xen-netback/interface.c b/drivers/net/xen-netback/interface.c
+index 6f996ac..1103568 100644
+--- a/drivers/net/xen-netback/interface.c
++++ b/drivers/net/xen-netback/interface.c
+@@ -533,10 +533,19 @@ int xenvif_init_queue(struct xenvif_queue *queue)
+ 					       XEN_NETIF_TX_RING_SIZE);
+ 		if (err)
+ 			goto err_disable;
++
++		err = init_persistent_gnt_tree(&queue->rx_gnts_tree,
++					       queue->rx_gnts_pages,
++					       XEN_NETIF_RX_RING_SIZE);
++		if (err)
++			goto err_free_tx;
+ 	}
+ 
+ 	return 0;
+ 
++err_free_tx:
++	gnttab_free_pages(XEN_NETIF_TX_RING_SIZE,
++			  queue->tx_gnts_pages);
+ err_disable:
+ 	netdev_err(queue->vif->dev, "Could not reserve tree pages.");
+ 	queue->vif->persistent_grants = 0;
+@@ -697,9 +706,12 @@ void xenvif_disconnect(struct xenvif *vif)
+ 
+ 		xenvif_unmap_frontend_rings(queue);
+ 
+-		if (queue->vif->persistent_grants)
++		if (queue->vif->persistent_grants) {
+ 			deinit_persistent_gnt_tree(&queue->tx_gnts_tree,
+ 						   queue->tx_gnts_pages);
++			deinit_persistent_gnt_tree(&queue->rx_gnts_tree,
++						   queue->rx_gnts_pages);
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/net/xen-netback/netback.c b/drivers/net/xen-netback/netback.c
+index 529d7c3..738b6ee 100644
+--- a/drivers/net/xen-netback/netback.c
++++ b/drivers/net/xen-netback/netback.c
+@@ -413,14 +413,62 @@ static void xenvif_rx_queue_drop_expired(struct xenvif_queue *queue)
+ }
+ 
+ struct netrx_pending_operations {
++	unsigned map_prod, map_cons;
+ 	unsigned copy_prod, copy_cons;
+ 	unsigned meta_prod, meta_cons;
+ 	struct gnttab_copy *copy;
+ 	struct xenvif_rx_meta *meta;
+ 	int copy_off;
+ 	grant_ref_t copy_gref;
++	struct page *copy_page;
++	unsigned copy_done;
+ };
+ 
++static void xenvif_create_rx_map_op(struct xenvif_queue *queue,
++				    struct gnttab_map_grant_ref *mop,
++				    grant_ref_t ref,
++				    struct page *page)
++{
++	queue->rx_pages_to_map[mop - queue->rx_map_ops] = page;
++	gnttab_set_map_op(mop,
++			  (unsigned long)page_to_kaddr(page),
++			  GNTMAP_host_map,
++			  ref, queue->vif->domid);
++}
++
++static struct page *get_next_rx_page(struct xenvif_queue *queue,
++				     struct netrx_pending_operations *npo)
++{
++	struct persistent_gnt_tree *tree = &queue->rx_gnts_tree;
++	struct persistent_gnt *gnt;
++	struct page *page = NULL;
++
++	gnt = get_persistent_gnt(tree, npo->copy_gref);
++	BUG_ON(IS_ERR(gnt));
++
++	if (likely(gnt)) {
++		page = gnt->page;
++		put_persistent_gnt(tree, gnt);
++		npo->copy_done++;
++		return page;
++	}
++
++	/* We couldn't find a match for the gref in the tree.
++	 * Map the page and add it to the tree. This page won't
++	 * be used for copying the packet but instead we will rely
++	 * grant copy. On the second time the gref is requested, the
++	 * persistent grant will be used instead.
++	 */
++	if (!get_free_page(tree, &page)) {
++		struct gnttab_map_grant_ref *mop;
++
++		mop = queue->rx_map_ops + npo->map_prod++;
++		xenvif_create_rx_map_op(queue, mop, npo->copy_gref, page);
++	}
++
++	return NULL;
++}
++
+ static struct xenvif_rx_meta *get_next_rx_buffer(struct xenvif_queue *queue,
+ 						 struct netrx_pending_operations *npo)
+ {
+@@ -437,10 +485,48 @@ static struct xenvif_rx_meta *get_next_rx_buffer(struct xenvif_queue *queue,
+ 
+ 	npo->copy_off = 0;
+ 	npo->copy_gref = req->gref;
+-
++	npo->copy_page = NULL;
++	if (queue->vif->persistent_grants)
++		npo->copy_page = get_next_rx_page(queue, npo);
+ 	return meta;
+ }
+ 
++static void xenvif_rx_copy_page(struct xenvif_queue *queue,
++				struct netrx_pending_operations *npo,
++				struct page *page, unsigned len,
++				unsigned offset)
++{
++	struct gnttab_copy *copy_gop;
++	struct xen_page_foreign *foreign = xen_page_foreign(page);
++
++	if (likely(npo->copy_page)) {
++		memcpy(page_address(npo->copy_page) + npo->copy_off,
++		       page_to_kaddr(page) + offset, len);
++		return;
++	}
++
++	/* No persistent grant found, so we rely on grant copy
++	 */
++	copy_gop = npo->copy + npo->copy_prod++;
++	copy_gop->flags = GNTCOPY_dest_gref;
++	copy_gop->len = len;
++
++	if (foreign) {
++		copy_gop->source.domid = foreign->domid;
++		copy_gop->source.u.ref = foreign->gref;
++		copy_gop->flags |= GNTCOPY_source_gref;
++	} else {
++		copy_gop->source.domid = DOMID_SELF;
++		copy_gop->source.u.gmfn =
++			virt_to_mfn(page_address(page));
++	}
++	copy_gop->source.offset = offset;
++
++	copy_gop->dest.domid = queue->vif->domid;
++	copy_gop->dest.offset = npo->copy_off;
++	copy_gop->dest.u.ref = npo->copy_gref;
++}
++
+ /*
+  * Set up the grant operations for this fragment. If it's a flipping
+  * interface, we also set up the unmap request from here.
+@@ -450,7 +536,6 @@ static void xenvif_gop_frag_copy(struct xenvif_queue *queue, struct sk_buff *skb
+ 				 struct page *page, unsigned long size,
+ 				 unsigned long offset, int *head)
+ {
+-	struct gnttab_copy *copy_gop;
+ 	struct xenvif_rx_meta *meta;
+ 	unsigned long bytes;
+ 	int gso_type = XEN_NETIF_GSO_TYPE_NONE;
+@@ -465,8 +550,6 @@ static void xenvif_gop_frag_copy(struct xenvif_queue *queue, struct sk_buff *skb
+ 	offset &= ~PAGE_MASK;
+ 
+ 	while (size > 0) {
+-		struct xen_page_foreign *foreign;
+-
+ 		BUG_ON(offset >= PAGE_SIZE);
+ 		BUG_ON(npo->copy_off > MAX_BUFFER_OFFSET);
+ 
+@@ -480,25 +563,7 @@ static void xenvif_gop_frag_copy(struct xenvif_queue *queue, struct sk_buff *skb
+ 		if (npo->copy_off + bytes > MAX_BUFFER_OFFSET)
+ 			bytes = MAX_BUFFER_OFFSET - npo->copy_off;
+ 
+-		copy_gop = npo->copy + npo->copy_prod++;
+-		copy_gop->flags = GNTCOPY_dest_gref;
+-		copy_gop->len = bytes;
+-
+-		foreign = xen_page_foreign(page);
+-		if (foreign) {
+-			copy_gop->source.domid = foreign->domid;
+-			copy_gop->source.u.ref = foreign->gref;
+-			copy_gop->flags |= GNTCOPY_source_gref;
+-		} else {
+-			copy_gop->source.domid = DOMID_SELF;
+-			copy_gop->source.u.gmfn =
+-				virt_to_mfn(page_address(page));
+-		}
+-		copy_gop->source.offset = offset;
+-
+-		copy_gop->dest.domid = queue->vif->domid;
+-		copy_gop->dest.offset = npo->copy_off;
+-		copy_gop->dest.u.ref = npo->copy_gref;
++		xenvif_rx_copy_page(queue, npo, page, bytes, offset);
+ 
+ 		npo->copy_off += bytes;
+ 		meta->size += bytes;
+@@ -590,6 +655,8 @@ static int xenvif_gop_skb(struct sk_buff *skb,
+ 	meta->id = req->id;
+ 	npo->copy_off = 0;
+ 	npo->copy_gref = req->gref;
++	if (queue->vif->persistent_grants)
++		npo->copy_page = get_next_rx_page(queue, npo);
+ 
+ 	data = skb->data;
+ 	while (data < skb_tail_pointer(skb)) {
+@@ -616,24 +683,74 @@ static int xenvif_gop_skb(struct sk_buff *skb,
+ }
+ 
+ /*
++ * Called to check if the grant maps succeded, and also adding
++ * them to the grant tree. If some of the grants already exist in the tree
++ * it will unmap those.
++ */
++static void xenvif_check_mop(struct xenvif_queue *queue, int nr_mops,
++			     struct netrx_pending_operations *npo)
++{
++	struct persistent_gnt_tree *tree = &queue->rx_gnts_tree;
++	struct gnttab_map_grant_ref *gop_map;
++	struct page *page;
++	int i;
++
++	for (i = 0; i < nr_mops; i++) {
++		struct persistent_gnt *persistent_gnt;
++
++		gop_map = queue->rx_map_ops + npo->map_cons++;
++		page = virt_to_page(gop_map->host_addr);
++
++		if (gop_map->status != GNTST_okay) {
++			if (net_ratelimit())
++				netdev_err(queue->vif->dev,
++					   "Bad status %d from map to DOM%d.\n",
++					   gop_map->status, queue->vif->domid);
++			put_free_pages(tree, &page, 1);
++			continue;
++		}
++
++		persistent_gnt = xenvif_pgrant_new(tree, gop_map);
++		if (unlikely(!persistent_gnt)) {
++			netdev_err(queue->vif->dev,
++				   "Couldn't add gref to the tree! ref: %d",
++				   gop_map->ref);
++			xenvif_page_unmap(queue, gop_map->handle, &page);
++			put_free_pages(tree, &page, 1);
++			kfree(persistent_gnt);
++			persistent_gnt = NULL;
++			continue;
++		}
++
++		put_persistent_gnt(tree, persistent_gnt);
++	}
++}
++
++/*
+  * This is a twin to xenvif_gop_skb.  Assume that xenvif_gop_skb was
+  * used to set up the operations on the top of
+  * netrx_pending_operations, which have since been done.  Check that
+  * they didn't give any errors and advance over them.
+  */
+-static int xenvif_check_gop(struct xenvif *vif, int nr_meta_slots,
++static int xenvif_check_gop(struct xenvif_queue *queue, int nr_meta_slots,
+ 			    struct netrx_pending_operations *npo)
+ {
+ 	struct gnttab_copy     *copy_op;
+ 	int status = XEN_NETIF_RSP_OKAY;
+ 	int i;
+ 
++	nr_meta_slots -= npo->copy_done;
++	if (npo->map_prod)
++		xenvif_check_mop(queue,
++				 npo->map_prod - npo->map_cons,
++				 npo);
++
+ 	for (i = 0; i < nr_meta_slots; i++) {
+ 		copy_op = npo->copy + npo->copy_cons++;
+ 		if (copy_op->status != GNTST_okay) {
+-			netdev_dbg(vif->dev,
++			netdev_dbg(queue->vif->dev,
+ 				   "Bad status %d from copy to DOM%d.\n",
+-				   copy_op->status, vif->domid);
++				   copy_op->status, queue->vif->domid);
+ 			status = XEN_NETIF_RSP_ERROR;
+ 		}
+ 	}
+@@ -686,7 +803,7 @@ static void xenvif_rx_action(struct xenvif_queue *queue)
+ 
+ 	struct netrx_pending_operations npo = {
+ 		.copy  = queue->grant_copy_op,
+-		.meta  = queue->meta,
++		.meta  = queue->meta
+ 	};
+ 
+ 	skb_queue_head_init(&rxq);
+@@ -705,13 +822,22 @@ static void xenvif_rx_action(struct xenvif_queue *queue)
+ 		__skb_queue_tail(&rxq, skb);
+ 	}
+ 
+-	BUG_ON(npo.meta_prod > ARRAY_SIZE(queue->meta));
+-
+-	if (!npo.copy_prod)
++	BUG_ON(npo.meta_prod > XEN_NETIF_RX_RING_SIZE);
++	if (!npo.copy_done && !npo.copy_prod)
+ 		goto done;
+ 
+ 	BUG_ON(npo.copy_prod > MAX_GRANT_COPY_OPS);
+-	gnttab_batch_copy(queue->grant_copy_op, npo.copy_prod);
++	if (npo.copy_prod)
++		gnttab_batch_copy(npo.copy, npo.copy_prod);
++
++	BUG_ON(npo.map_prod > MAX_GRANT_COPY_OPS);
++	if (npo.map_prod) {
++		ret = gnttab_map_refs(queue->rx_map_ops,
++				      NULL,
++				      queue->rx_pages_to_map,
++				      npo.map_prod);
++		BUG_ON(ret);
++	}
+ 
+ 	while ((skb = __skb_dequeue(&rxq)) != NULL) {
+ 
+@@ -734,7 +860,7 @@ static void xenvif_rx_action(struct xenvif_queue *queue)
+ 		queue->stats.tx_bytes += skb->len;
+ 		queue->stats.tx_packets++;
+ 
+-		status = xenvif_check_gop(queue->vif,
++		status = xenvif_check_gop(queue,
+ 					  XENVIF_RX_CB(skb)->meta_slots_used,
+ 					  &npo);
+ 
+-- 
+2.1.3
+
